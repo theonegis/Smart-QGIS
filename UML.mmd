@@ -1,0 +1,56 @@
+%%{
+  init: {
+    "themeVariables": {
+      "fontFamily": "Aptos",
+    },
+  }
+}%%
+sequenceDiagram
+    participant U as User
+    participant Q as QGIS Plugin
+    participant C as MCP Client
+    participant M as MCP Server
+    participant S as Socket Server
+    participant O as Ollama LLM
+    %% Plugin Initialization
+    Q ->> O: Request Available Models (/api/tags)
+    O -->> Q: Return Model List
+    Q ->> C: Create MCP Client & Start Server Process
+    C ->> M: Start MCP Server Process
+    M ->> S: Connect to Socket Server
+    S -->> M: Connection Established
+    %% Tool Discovery
+    Q ->> C: List available tools request
+    C ->> M: Forward tools/list request
+    M -->> C: Return Available Tools
+    C -->> Q: Return Available Tools
+    %% Chat Interaction
+    U ->> Q: Send Message
+    Q ->> C: Send Chat Request with Tools
+    C ->> M: Forward Chat Request to Ollama (/api/chat)
+    M ->> O: Forward Request to Ollama API
+    O -->> M: Return Response/Tool Calls
+    M -->> C: Return Response/Tool Calls
+    C -->> Q: Return Response/Tool Calls
+
+    alt If Tool Call Required
+        Q ->> C: Execute Tool Request
+        C ->> M: Forward Tool Execution
+        M ->> S: Execute Tool via Socket
+        S ->> Q: Process Tool Request
+        Q -->> S: Return Tool Result
+        S -->> M: Return Tool Result
+        M ->> O: Send Tool Result to Ollama
+        O -->> M: Return Final Response
+        M -->> C: Return Final Response
+        C -->> Q: Return Final Response
+    end
+
+    Q -->> U: Display Response
+    %% Layer Operations Example
+    Note over M, S: Example of Tool Execution
+    M ->> S: get_layers() request
+    S ->> Q: action_get_layers()
+    Q ->> Q: Access QGIS Layers
+    Q -->> S: Return Layer Data
+    S -->> M: Forward Layer Data
