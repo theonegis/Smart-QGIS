@@ -14,8 +14,8 @@ Smart-QGIS is a QGIS plugin that runs an MCP server and interfaces with local LL
 
 ## Main components
 
-![UML of the main components](UML-Smart-QGIS-1.png)
+![UML of the main components](UML-Smart-QGIS.png)
 
 ## Thanks
 
-This project is strongly inspired by [QGISMCP](https://github.com/jjsantos01/qgis_mcp) project. 
+This project is strongly inspired by [QGISMCP](https://github.com/jjsantos01/qgis_mcp) project.
