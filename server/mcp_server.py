@@ -212,6 +212,20 @@ def remove_layer(ctx: Context, layer_id: str) -> str:
     result = qgis.send_command("remove_layer", {"layer_id": layer_id})
     return json.dumps(result, indent=2)
 
+
+@mcp.tool()
+def rename_layer(ctx: Context, layer_id: str, new_name: str) -> str:
+    """
+    Rename a layer in the project.
+    
+    Args:
+        layer_id: The ID of the layer to rename
+        new_name: The new name for the layer
+    """
+    qgis = get_qgis_connection()
+    result = qgis.send_command("rename_layer", {"layer_id": layer_id, "new_name": new_name})
+    return json.dumps(result, indent=2)
+
 @mcp.tool()
 def zoom_to_layer(ctx: Context, layer_id: str) -> str:
     """Zoom to the extent of a specified layer."""
@@ -256,6 +270,29 @@ def save_project(ctx: Context, path: str) -> str:
     if path:
         params["path"] = path
     result = qgis.send_command("save_project", params)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def save_layer(ctx: Context, layer_id: str, output_path: str, target_crs: Optional[str] = None, driver_name: str = "ESRI Shapefile") -> str:
+    """
+    Save a layer to a file with optional reprojection.
+    
+    Args:
+        layer_id: The ID of the layer to save
+        output_path: Full path where the file should be saved (e.g., "/Users/username/Desktop/layer.shp")
+        target_crs: Optional CRS to reproject to (e.g., "EPSG:4610" for Gauss-Kruger). If not specified, uses the layer's CRS.
+        driver_name: Output driver name (default: "ESRI Shapefile"). Other options: "GeoJSON", "GPKG", "KML", etc.
+    """
+    qgis = get_qgis_connection()
+    params = {
+        "layer_id": layer_id,
+        "output_path": output_path,
+        "driver_name": driver_name
+    }
+    if target_crs:
+        params["target_crs"] = target_crs
+    result = qgis.send_command("save_layer", params)
     return json.dumps(result, indent=2)
 
 

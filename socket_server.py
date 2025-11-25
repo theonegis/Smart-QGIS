@@ -2,15 +2,10 @@ import socket
 import json
 import threading
 import traceback
-from qgis.core import (
-    Qgis,
-    QgsMessageLog,
-    QgsProject,
-    QgsVectorLayer,
-    QgsMapRendererParallelJob
-)
+from qgis.core import *
+from qgis import processing
 from qgis.PyQt import QtCore
-from qgis.PyQt.QtCore import Qt, QObject, QSize, pyqtSlot, pyqtSignal
+from qgis.PyQt.QtCore import *
 
 """
 1. MCP Server sends JSON: {"type": "zoom_to_layer", ...}
@@ -86,7 +81,6 @@ class RequestHandler(QObject):
 
     @staticmethod
     def action_get_qgis_info(params):
-        from qgis.core import Qgis
         return {
             "status": "success",
             "version": Qgis.version(),
@@ -160,6 +154,21 @@ class RequestHandler(QObject):
         QgsProject.instance().removeMapLayer(layer_id)
         return {"status": "success"}
 
+    @staticmethod
+    def action_rename_layer(params):
+        layer_id = params.get("layer_id")
+        new_name = params.get("new_name")
+        
+        if not new_name:
+            return {"status": "error", "message": "new_name is required"}
+        
+        layer = QgsProject.instance().mapLayer(layer_id)
+        if not layer:
+            return {"status": "error", "message": "Layer not found"}
+        
+        layer.setName(new_name)
+        return {"status": "success", "layer_id": layer_id, "new_name": new_name}
+
     def action_zoom_to_layer(self, params):
         layer_id = params.get("layer_id")
         layer = self._get_layer_by_id(layer_id)
@@ -178,7 +187,6 @@ class RequestHandler(QObject):
         if not layer or layer.type() != QgsVectorLayer.VectorLayer:
             return {"status": "error", "message": "Invalid vector layer"}
         
-        from qgis.core import QgsFeatureRequest
         request = QgsFeatureRequest()
         if filter_expression:
             request.setFilterExpression(filter_expression)
@@ -200,7 +208,6 @@ class RequestHandler(QObject):
 
     @staticmethod
     def action_execute_processing(params):
-        from qgis import processing
         algorithm = params.get("algorithm")
         parameters = params.get("parameters", {})
 
@@ -227,6 +234,34 @@ class RequestHandler(QObject):
             QgsProject.instance().write()
         return {"status": "success"}
 
+    @staticmethod
+    def action_save_layer(params):
+        layer_id = params.get("layer_id")
+        output_path = params.get("output_path")
+        target_crs_authid = params.get("target_crs")  # Optional, e.g. "EPSG:4610"
+        driver_name = params.get("driver_name", "ESRI Shapefile")
+
+        layer = QgsProject.instance().mapLayer(layer_id)
+        if not layer or not layer.isValid():
+            return {"status": "error", "message": "Invalid layer"}
+
+        # Use target CRS if provided, otherwise use layer's CRS
+        crs = QgsCoordinateReferenceSystem(target_crs_authid) if target_crs_authid else layer.crs()
+
+        # writeAsVectorFormat returns (error_code, error_message)
+        error = QgsVectorFileWriter.writeAsVectorFormat(
+            layer,
+            output_path,
+            "UTF-8",
+            crs,
+            driver_name
+        )
+
+        if error[0] == QgsVectorFileWriter.NoError:
+            return {"status": "success", "path": output_path}
+        else:
+            return {"status": "error", "message": f"Failed to save layer: {error[1]}"}
+
     def action_render_map(self, params):
         path = params.get("path")
         width = params.get("width", 800)
@@ -247,7 +282,7 @@ class RequestHandler(QObject):
         code = params.get("code")
         try:
             # Execute in a restricted scope, but with access to iface/qgis
-            local_scope = {"iface": self.iface, "QgsProject": QgsProject}
+            local_scope = {"iface": self.iface, "QgsProject": QgsProject, "QgsApplication": QgsApplication}
             exec(code, globals(), local_scope)
             return {"status": "success"}
         except Exception as e:
@@ -266,10 +301,6 @@ class RequestHandler(QObject):
         layer = QgsVectorLayer(uri, name, "memory")
         if not layer.isValid():
             return {"status": "error", "message": "Failed to create memory layer"}
-        
-        # Add fields
-        from qgis.core import QgsField
-        from qgis.PyQt.QtCore import QVariant
         
         qgs_fields = []
         for f in fields:
@@ -301,8 +332,6 @@ class RequestHandler(QObject):
         layer = self._get_layer_by_id(layer_id)
         if not layer or layer.type() != QgsVectorLayer.VectorLayer:
             return {"status": "error", "message": "Invalid layer"}
-            
-        from qgis.core import QgsFeature, QgsGeometry
         
         qgs_features = []
         fields = layer.fields()
@@ -343,7 +372,6 @@ class RequestHandler(QObject):
         # 1. Create new memory layer with same properties
         crs = source_layer.crs().authid()
         wkb_type = source_layer.wkbType()
-        from qgis.core import QgsWkbTypes
         geometry_type = QgsWkbTypes.displayString(wkb_type)
         
         # Construct URI for memory layer
@@ -361,7 +389,6 @@ class RequestHandler(QObject):
         new_layer.updateFields()
         
         # 3. Get features with filter
-        from qgis.core import QgsFeatureRequest, QgsFeature
         request = QgsFeatureRequest()
         if filter_expression:
             QgsMessageLog.logMessage(f"Extracting with filter: {filter_expression}", LOG_TAG, Qgis.Info)

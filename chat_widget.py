@@ -86,7 +86,6 @@ class ChatWorker(QtCore.QObject):
         while self.is_running:
             payload = {
                 "model": self.model,
-                "think": False,
                 "messages": self.messages,
                 "stream": True
             }
@@ -97,8 +96,16 @@ class ChatWorker(QtCore.QObject):
             full_content = ""
             collected_tool_calls = []
 
+            # Log the request payload for debugging
+            QgsMessageLog.logMessage(f"Sending request to Ollama with model: {self.model}", LOG_TAG, Qgis.Info)
+            QgsMessageLog.logMessage(f"Number of messages: {len(self.messages)}", LOG_TAG, Qgis.Info)
+            QgsMessageLog.logMessage(f"Number of tools: {len(tools)}", LOG_TAG, Qgis.Info)
+
             try:
                 with requests.post(url, json=payload, stream=True) as response:
+                    if response.status_code != 200:
+                        error_detail = response.text
+                        QgsMessageLog.logMessage(f"Ollama API Error: {response.status_code} - {error_detail}", LOG_TAG, Qgis.Critical)
                     response.raise_for_status()
                     for line in response.iter_lines():
                         if not self.is_running:
@@ -392,8 +399,9 @@ class ChatDockWidget(QtWidgets.QDockWidget):
             return
 
         model = self.combo_models.currentText()
-        if not model or model == "Loading..." or model == "Cannot load Ollama models":
-            QgsMessageLog.logMessage("No model selected", LOG_TAG, Qgis.Critical)
+        if not model or model in ["Loading...", "Cannot load Ollama models", "No models found"]:
+            QgsMessageLog.logMessage(f"Invalid model selected: {model}", LOG_TAG, Qgis.Critical)
+            self.txt_history.append("<i>Error: Please select a valid model.</i>")
             return
 
         # Disable send, enable stop
