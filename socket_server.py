@@ -4,8 +4,9 @@ import threading
 import traceback
 from qgis.core import *
 from qgis import processing
-from qgis.PyQt import QtCore
+from qgis.PyQt import QtCore, QtGui
 from qgis.PyQt.QtCore import *
+from qgis.PyQt.QtGui import *
 
 """
 1. MCP Server sends JSON: {"type": "zoom_to_layer", ...}
@@ -53,8 +54,7 @@ class RequestHandler(QObject):
         finally:
             event.set()
 
-    @staticmethod
-    def _get_layer_by_id(layer_id):
+    def _get_layer_by_id(self, layer_id):
         return QgsProject.instance().mapLayer(layer_id)
 
     def handle_request(self, command):
@@ -136,16 +136,344 @@ class RequestHandler(QObject):
         else:
             return {"status": "error", "message": "Failed to load layer"}
 
+    def action_add_xyz_tile_layer(self, params):
+        url = params.get("url")
+        name = params.get("name", "XYZ Layer")
+        
+        # Built-in URLs
+        builtin_urls = {
+            "Google Roadmap": "http://mt0.google.com/vt/lyrs=m&hl=en&x={x}&y={y}&z={z}",
+            "Google Terrain": "http://mt0.google.com/vt/lyrs=p&hl=en&x={x}&y={y}&z={z}",
+            "Google Satellite": "http://mt0.google.com/vt/lyrs=s&hl=en&x={x}&y={y}&z={z}",
+            "OpenStreetMap": "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+        }
+        
+        if not url:
+            # Try to find by name (case-insensitive lookup)
+            for key, val in builtin_urls.items():
+                if key.lower() == name.lower():
+                    url = val
+                    # Use the proper casing for the name if it was a match
+                    if name.lower() == "google roadmap": name = "Google Roadmap"
+                    elif name.lower() == "google terrain": name = "Google Terrain"
+                    elif name.lower() == "google satellite": name = "Google Satellite"
+                    elif name.lower() == "openstreetmap": name = "OpenStreetMap"
+                    break
+        
+        if not url:
+            return {"status": "error", "message": "URL not provided and name not found in built-in list"}
+            
+        # Construct XYZ layer URI
+        # type=xyz&url=...&zmin=0&zmax=22
+        uri = f"type=xyz&url={url}&zmin=0&zmax=22"
+        
+        layer = self.iface.addRasterLayer(uri, name, "wms")
+        if layer and layer.isValid():
+            return {"status": "success", "layer_id": layer.id(), "name": layer.name()}
+        else:
+            return {"status": "error", "message": "Failed to load XYZ layer"}
+
+    def action_set_point_layer_style(self, params):
+        layer_id = params.get("layer_id")
+        color = params.get("color")
+        size = params.get("size")
+        shape = params.get("shape")
+        
+        layer = self._get_layer_by_id(layer_id)
+        if not layer or layer.type() != QgsVectorLayer.VectorLayer:
+            return {"status": "error", "message": "Invalid vector layer"}
+            
+        if layer.geometryType() != QgsWkbTypes.PointGeometry:
+             return {"status": "error", "message": "Layer is not a point layer"}
+
+        # Get current renderer or create a new single symbol renderer
+        renderer = layer.renderer()
+        if not isinstance(renderer, QgsSingleSymbolRenderer):
+            symbol = QgsMarkerSymbol.createSimple({})
+            renderer = QgsSingleSymbolRenderer(symbol)
+            layer.setRenderer(renderer)
+        
+        symbol = renderer.symbol()
+        if not isinstance(symbol, QgsMarkerSymbol):
+             return {"status": "error", "message": "Layer does not use a marker symbol"}
+             
+        if symbol.symbolLayerCount() > 0:
+            sym_layer = symbol.symbolLayer(0)
+            if isinstance(sym_layer, QgsSimpleMarkerSymbolLayer):
+                if color:
+                    sym_layer.setColor(QColor(color))
+                    sym_layer.setStrokeColor(QColor("black"))
+                if size is not None:
+                    sym_layer.setSize(float(size))
+                if shape:
+                    shape_map = {
+                        "circle": QgsSimpleMarkerSymbolLayer.Circle,
+                        "square": QgsSimpleMarkerSymbolLayer.Square,
+                        "rectangle": QgsSimpleMarkerSymbolLayer.Square,
+                        "diamond": QgsSimpleMarkerSymbolLayer.Diamond,
+                        "cross": QgsSimpleMarkerSymbolLayer.Cross,
+                        "star": QgsSimpleMarkerSymbolLayer.Star,
+                        "triangle": QgsSimpleMarkerSymbolLayer.Triangle
+                    }
+                    if shape.lower() in shape_map:
+                        sym_layer.setShape(shape_map[shape.lower()])
+        
+        layer.triggerRepaint()
+        self.iface.layerTreeView().refreshLayerSymbology(layer.id())
+        return {"status": "success"}
+
+    def action_set_line_layer_style(self, params):
+        layer_id = params.get("layer_id")
+        color = params.get("color")
+        width = params.get("width")
+        line_style = params.get("line_style")
+        
+        layer = self._get_layer_by_id(layer_id)
+        if not layer or layer.type() != QgsVectorLayer.VectorLayer:
+            return {"status": "error", "message": "Invalid vector layer"}
+            
+        if layer.geometryType() != QgsWkbTypes.LineGeometry:
+             return {"status": "error", "message": "Layer is not a line layer"}
+
+        renderer = layer.renderer()
+        if not isinstance(renderer, QgsSingleSymbolRenderer):
+            symbol = QgsLineSymbol.createSimple({})
+            renderer = QgsSingleSymbolRenderer(symbol)
+            layer.setRenderer(renderer)
+        
+        symbol = renderer.symbol()
+        if not isinstance(symbol, QgsLineSymbol):
+             return {"status": "error", "message": "Layer does not use a line symbol"}
+            
+        if symbol.symbolLayerCount() > 0:
+            sym_layer = symbol.symbolLayer(0)
+            if isinstance(sym_layer, QgsSimpleLineSymbolLayer):
+                if color:
+                    sym_layer.setColor(QColor(color))
+                if width is not None:
+                    sym_layer.setWidth(float(width))
+                if line_style:
+                    style_map = {
+                        "solid": Qt.SolidLine,
+                        "dash": Qt.DashLine,
+                        "dashed": Qt.DashLine,
+                        "dot": Qt.DotLine,
+                        "dotted": Qt.DotLine,
+                        "dashdot": Qt.DashDotLine,
+                        "dashdotdot": Qt.DashDotDotLine
+                    }
+                    if line_style.lower() in style_map:
+                        sym_layer.setPenStyle(style_map[line_style.lower()])
+        
+        layer.triggerRepaint()
+        self.iface.layerTreeView().refreshLayerSymbology(layer.id())
+        return {"status": "success"}
+
+    def action_set_polygon_layer_style(self, params):
+        try:
+            QgsMessageLog.logMessage(f"action_set_polygon_layer_style called with params: {params}", LOG_TAG, Qgis.Info)
+            
+            layer_id = params.get("layer_id")
+            fill_color = params.get("fill_color")
+            fill_style = params.get("fill_style")
+            outline_color = params.get("outline_color")
+            outline_width = params.get("outline_width")
+            
+            layer = self._get_layer_by_id(layer_id)
+            if not layer or layer.type() != QgsVectorLayer.VectorLayer:
+                return {"status": "error", "message": "Invalid vector layer"}
+                
+            if layer.geometryType() != QgsWkbTypes.PolygonGeometry:
+                 return {"status": "error", "message": "Layer is not a polygon layer"}
+
+            renderer = layer.renderer()
+            if not isinstance(renderer, QgsSingleSymbolRenderer):
+                symbol = QgsFillSymbol.createSimple({})
+                renderer = QgsSingleSymbolRenderer(symbol)
+                layer.setRenderer(renderer)
+            
+            symbol = renderer.symbol()
+            if not isinstance(symbol, QgsFillSymbol):
+                 return {"status": "error", "message": "Layer does not use a fill symbol"}
+                
+            if symbol.symbolLayerCount() > 0:
+                sym_layer = symbol.symbolLayer(0)
+                if isinstance(sym_layer, QgsSimpleFillSymbolLayer):
+                    if fill_color:
+                        sym_layer.setColor(QColor(fill_color))
+                    if fill_style:
+                        style_map = {
+                            "solid": Qt.SolidPattern,
+                            "horizontal": Qt.HorPattern,
+                            "vertical": Qt.VerPattern,
+                            "cross": Qt.CrossPattern,
+                            "b_diagonal": Qt.BDiagPattern,
+                            "f_diagonal": Qt.FDiagPattern,
+                            "diagonal_cross": Qt.DiagCrossPattern,
+                            "no_brush": Qt.NoBrush
+                        }
+                        if fill_style.lower() in style_map:
+                            sym_layer.setBrushStyle(style_map[fill_style.lower()])
+                    if outline_color:
+                        sym_layer.setStrokeColor(QColor(outline_color))
+                    if outline_width is not None:
+                        sym_layer.setStrokeWidth(float(outline_width))
+            
+            layer.triggerRepaint()
+            self.iface.layerTreeView().refreshLayerSymbology(layer.id())
+            
+            QgsMessageLog.logMessage("action_set_polygon_layer_style completed successfully", LOG_TAG, Qgis.Info)
+            return {"status": "success"}
+        except Exception as e:
+            error_msg = f"Error in action_set_polygon_layer_style: {str(e)}"
+            QgsMessageLog.logMessage(error_msg, LOG_TAG, Qgis.Critical)
+            QgsMessageLog.logMessage(traceback.format_exc(), LOG_TAG, Qgis.Critical)
+            return {"status": "error", "message": error_msg}
+
+    def action_set_categorized_polygon_style(self, params):
+        layer_id = params.get("layer_id")
+        field_name = params.get("field_name")
+        color_scheme = params.get("color_scheme", "random")
+        
+        layer = self._get_layer_by_id(layer_id)
+        if not layer or layer.type() != QgsVectorLayer.VectorLayer:
+            return {"status": "error", "message": "Invalid vector layer"}
+            
+        if layer.geometryType() != QgsWkbTypes.PolygonGeometry:
+             return {"status": "error", "message": "Layer is not a polygon layer"}
+        
+        # Generate colors based on scheme
+        import random
+        import colorsys
+        
+        categories = []
+        
+        # MODE 1: No field_name - unique color per feature
+        if not field_name:
+            # Use feature ID as the categorization field
+            # Create a temporary field "$id" that contains the feature ID
+            num_features = layer.featureCount()
+            if num_features == 0:
+                return {"status": "error", "message": "Layer has no features"}
+            
+            # Get all feature IDs
+            feature_ids = [f.id() for f in layer.getFeatures()]
+            
+            for i, fid in enumerate(feature_ids):
+                # Generate color based on scheme
+                if color_scheme == "rainbow":
+                    hue = i / num_features
+                    rgb = colorsys.hsv_to_rgb(hue, 0.8, 0.9)
+                    color = QColor(int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255))
+                elif color_scheme == "gradient":
+                    ratio = i / max(num_features - 1, 1)
+                    color = QColor(int(ratio * 255), 0, int((1 - ratio) * 255))
+                else:  # random
+                    color = QColor(random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+                
+                # Create symbol for this feature
+                symbol = QgsFillSymbol.createSimple({
+                    'color': color.name(),
+                    'outline_color': 'black',
+                    'outline_width': '0.26'
+                })
+                
+                # Create category using feature ID
+                category = QgsRendererCategory(fid, symbol, f"Feature {fid}")
+                categories.append(category)
+            
+            # Create categorized renderer using $id field
+            renderer = QgsCategorizedSymbolRenderer("$id", categories)
+            layer.setRenderer(renderer)
+            layer.triggerRepaint()
+            self.iface.layerTreeView().refreshLayerSymbology(layer.id())
+            
+            return {"status": "success", "message": f"Applied {color_scheme} unique colors to {num_features} features"}
+        
+        # MODE 2: With field_name - categorize by field values
+        else:
+            # Check if field exists
+            field_index = layer.fields().indexOf(field_name)
+            if field_index == -1:
+                available_fields = [f.name() for f in layer.fields()]
+                return {"status": "error", "message": f"Field '{field_name}' not found. Available fields: {', '.join(available_fields)}"}
+            
+            # Get unique values from the field
+            unique_values = layer.uniqueValues(field_index)
+            if not unique_values:
+                return {"status": "error", "message": f"No values found in field '{field_name}'"}
+            
+            num_categories = len(unique_values)
+            
+            for i, value in enumerate(sorted(unique_values, key=lambda x: str(x))):
+                # Generate color based on scheme
+                if color_scheme == "rainbow":
+                    hue = i / num_categories
+                    rgb = colorsys.hsv_to_rgb(hue, 0.8, 0.9)
+                    color = QColor(int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255))
+                elif color_scheme == "gradient":
+                    ratio = i / max(num_categories - 1, 1)
+                    color = QColor(int(ratio * 255), 0, int((1 - ratio) * 255))
+                else:  # random
+                    color = QColor(random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+                
+                # Create symbol for this category
+                symbol = QgsFillSymbol.createSimple({
+                    'color': color.name(),
+                    'outline_color': 'black',
+                    'outline_width': '0.26'
+                })
+                
+                # Create category
+                category = QgsRendererCategory(value, symbol, str(value))
+                categories.append(category)
+            
+            # Create and apply categorized renderer
+            renderer = QgsCategorizedSymbolRenderer(field_name, categories)
+            layer.setRenderer(renderer)
+            layer.triggerRepaint()
+            self.iface.layerTreeView().refreshLayerSymbology(layer.id())
+            
+            return {"status": "success", "message": f"Applied {color_scheme} categorized styling with {num_categories} categories based on field '{field_name}'"}
+
     @staticmethod
     def action_get_layers(params):
         layers = []
+        # We need to access iface to get the active layer, but this method is static.
+        # We should change it to an instance method or pass iface somehow.
+        # However, RequestHandler has self.iface.
+        # Let's change @staticmethod to instance method (remove @staticmethod)
+        # But wait, the caller might be calling it as static?
+        # The dispatcher `handle_request` calls `getattr(self, method_name)(params)`.
+        # So it's fine to make it an instance method.
+        pass 
+
+    def action_get_layers(self, params):
+        layers = []
+        active_layer = self.iface.activeLayer()
+        active_layer_id = active_layer.id() if active_layer else None
+        
         for layer in QgsProject.instance().mapLayers().values():
-            layers.append({
+            layer_info = {
                 "id": layer.id(),
                 "name": layer.name(),
                 "type": layer.type().name,
-                "crs": layer.crs().authid()
-            })
+                "crs": layer.crs().authid(),
+                "active": (layer.id() == active_layer_id)
+            }
+            if layer.type() == QgsMapLayer.VectorLayer:
+                # Map geometry type enum to string manually to ensure consistency and avoid TypeError
+                g_type = layer.geometryType()
+                if g_type == QgsWkbTypes.PointGeometry:
+                    layer_info["geometry_type"] = "Point"
+                elif g_type == QgsWkbTypes.LineGeometry:
+                    layer_info["geometry_type"] = "Line"
+                elif g_type == QgsWkbTypes.PolygonGeometry:
+                    layer_info["geometry_type"] = "Polygon"
+                else:
+                    layer_info["geometry_type"] = "Unknown"
+            
+            layers.append(layer_info)
         return {"status": "success", "layers": layers}
 
     @staticmethod
@@ -282,7 +610,13 @@ class RequestHandler(QObject):
         code = params.get("code")
         try:
             # Execute in a restricted scope, but with access to iface/qgis
-            local_scope = {"iface": self.iface, "QgsProject": QgsProject, "QgsApplication": QgsApplication}
+            local_scope = {
+                "iface": self.iface, 
+                "QgsProject": QgsProject, 
+                "QgsApplication": QgsApplication,
+                "QColor": QColor,
+                "QgsWkbTypes": QgsWkbTypes
+            }
             exec(code, globals(), local_scope)
             return {"status": "success"}
         except Exception as e:
