@@ -115,9 +115,14 @@ class RequestHandler(QObject):
         }
 
     def action_add_vector_layer(self, params):
+        import os
         path = params.get("path")
-        name = params.get("name", "Layer")
+        name = params.get("name")
         provider = params.get("provider", "ogr")
+        
+        # If name is not provided, extract filename without extension
+        if not name:
+            name = os.path.splitext(os.path.basename(path))[0]
 
         layer = self.iface.addVectorLayer(path, name, provider)
         if layer and layer.isValid():
@@ -126,9 +131,14 @@ class RequestHandler(QObject):
             return {"status": "error", "message": "Failed to load layer"}
 
     def action_add_raster_layer(self, params):
+        import os
         path = params.get("path")
-        name = params.get("name", "Layer")
+        name = params.get("name")
         provider = params.get("provider", "gdal")
+        
+        # If name is not provided, extract filename without extension
+        if not name:
+            name = os.path.splitext(os.path.basename(path))[0]
 
         layer = self.iface.addRasterLayer(path, name, provider)
         if layer and layer.isValid():
@@ -180,7 +190,7 @@ class RequestHandler(QObject):
         shape = params.get("shape")
         
         layer = self._get_layer_by_id(layer_id)
-        if not layer or layer.type() != QgsVectorLayer.VectorLayer:
+        if not layer or not isinstance(layer, QgsVectorLayer):
             return {"status": "error", "message": "Invalid vector layer"}
             
         if layer.geometryType() != QgsWkbTypes.PointGeometry:
@@ -229,7 +239,7 @@ class RequestHandler(QObject):
         line_style = params.get("line_style")
         
         layer = self._get_layer_by_id(layer_id)
-        if not layer or layer.type() != QgsVectorLayer.VectorLayer:
+        if not layer or not isinstance(layer, QgsVectorLayer):
             return {"status": "error", "message": "Invalid vector layer"}
             
         if layer.geometryType() != QgsWkbTypes.LineGeometry:
@@ -280,7 +290,7 @@ class RequestHandler(QObject):
             outline_width = params.get("outline_width")
             
             layer = self._get_layer_by_id(layer_id)
-            if not layer or layer.type() != QgsVectorLayer.VectorLayer:
+            if not layer or not isinstance(layer, QgsVectorLayer):
                 return {"status": "error", "message": "Invalid vector layer"}
                 
             if layer.geometryType() != QgsWkbTypes.PolygonGeometry:
@@ -336,7 +346,7 @@ class RequestHandler(QObject):
         color_scheme = params.get("color_scheme", "random")
         
         layer = self._get_layer_by_id(layer_id)
-        if not layer or layer.type() != QgsVectorLayer.VectorLayer:
+        if not layer or not isinstance(layer, QgsVectorLayer):
             return {"status": "error", "message": "Invalid vector layer"}
             
         if layer.geometryType() != QgsWkbTypes.PolygonGeometry:
@@ -436,6 +446,263 @@ class RequestHandler(QObject):
             
             return {"status": "success", "message": f"Applied {color_scheme} categorized styling with {num_categories} categories based on field '{field_name}'"}
 
+    def _resolve_layer(self, layer_id, layer_name, layer_type_class=None):
+        """
+        Smart layer resolution helper.
+        Priority:
+        1. layer_id (exact match)
+        2. layer_name (fuzzy match)
+        3. Active layer (if matches type)
+        4. Single layer of type (if only one exists)
+        """
+        # 1. Try by ID
+        if layer_id:
+            layer = QgsProject.instance().mapLayer(layer_id)
+            if layer:
+                if layer_type_class and not isinstance(layer, layer_type_class):
+                    return None, f"Layer with ID {layer_id} is not of type {layer_type_class.__name__}"
+                return layer, None
+            return None, f"Layer with ID {layer_id} not found"
+
+        # Get all layers
+        layers = list(QgsProject.instance().mapLayers().values())
+        
+        # Filter by type if specified
+        if layer_type_class:
+            layers = [l for l in layers if isinstance(l, layer_type_class)]
+            if not layers:
+                return None, f"No layers of type {layer_type_class.__name__} found in project"
+
+        # 2. Try by Name (if provided)
+        if layer_name:
+            # Fuzzy match
+            matches = [l for l in layers if layer_name.lower() in l.name().lower()]
+            
+            if not matches:
+                # Fallback to active layer if it matches type
+                active_layer = self.iface.activeLayer()
+                if active_layer and (not layer_type_class or isinstance(active_layer, layer_type_class)):
+                    return active_layer, None
+                
+                # Fallback to single layer if only one exists
+                if len(layers) == 1:
+                    return layers[0], None
+                    
+                return None, f"No layer found matching '{layer_name}'"
+            
+            if len(matches) == 1:
+                return matches[0], None
+            
+            # Multiple matches - try to find active one
+            active_matches = [l for l in matches if l == self.iface.activeLayer()]
+            if active_matches:
+                return active_matches[0], None
+                
+            names = [l.name() for l in matches]
+            return None, f"Multiple layers match '{layer_name}': {', '.join(names)}"
+
+        # 3. No ID or Name - Try Active Layer
+        active_layer = self.iface.activeLayer()
+        if active_layer:
+            if not layer_type_class or isinstance(active_layer, layer_type_class):
+                return active_layer, None
+
+        # 4. Try Single Layer
+        if len(layers) == 1:
+            return layers[0], None
+
+        return None, "No layer specified and could not determine active/single layer"
+
+    def action_set_raster_transparency(self, params):
+        """Set transparency and NODATA values for a raster layer."""
+        try:
+            layer_id = params.get("layer_id")
+            layer_name = params.get("layer_name")
+            transparency = params.get("transparency")  # 0-100 percentage
+            nodata_value = params.get("nodata_value")
+            band = params.get("band", 1)  # Default to band 1
+            
+            layer, error = self._resolve_layer(layer_id, layer_name, QgsRasterLayer)
+            if not layer:
+                return {"status": "error", "message": error}
+            
+            # Double check type just in case (though _resolve_layer handles it)
+            if not isinstance(layer, QgsRasterLayer):
+                return {"status": "error", "message": "Layer is not a raster layer"}
+            
+            # Set overall layer transparency if provided
+            if transparency is not None:
+                # Convert percentage (0-100) to opacity (0.0-1.0)
+                # transparency=0 means fully opaque (opacity=1.0)
+                # transparency=100 means fully transparent (opacity=0.0)
+                opacity = 1.0 - (float(transparency) / 100.0)
+                opacity = max(0.0, min(1.0, opacity))  # Clamp to valid range
+                
+                renderer = layer.renderer()
+                if renderer:
+                    renderer.setOpacity(opacity)
+                    QgsMessageLog.logMessage(f"Set raster opacity to {opacity} (transparency {transparency}%)", LOG_TAG, Qgis.Info)
+            
+            # Set NODATA value if provided
+            if nodata_value is not None:
+                data_provider = layer.dataProvider()
+                if not data_provider:
+                    return {"status": "error", "message": "Could not access raster data provider"}
+                
+                # Validate band number
+                if band < 1 or band > layer.bandCount():
+                    return {"status": "error", "message": f"Invalid band number {band}. Layer has {layer.bandCount()} bands."}
+                
+                # Set user-defined NODATA value
+                # Create a range for the exact value
+                nodata_ranges = [QgsRasterRange(float(nodata_value), float(nodata_value))]
+                success = data_provider.setUserNoDataValue(band, nodata_ranges)
+                
+                if success:
+                    QgsMessageLog.logMessage(f"Set NODATA value {nodata_value} for band {band}", LOG_TAG, Qgis.Info)
+                else:
+                    QgsMessageLog.logMessage(f"Failed to set NODATA value for band {band}", LOG_TAG, Qgis.Warning)
+                
+                # Refresh the layer to apply changes
+                layer.dataProvider().reloadData()
+            
+            # Trigger repaint to show changes
+            layer.triggerRepaint()
+            self.iface.layerTreeView().refreshLayerSymbology(layer.id())
+            
+            result_msg = "Raster transparency settings applied successfully"
+            if transparency is not None and nodata_value is not None:
+                result_msg = f"Set transparency to {transparency}% and NODATA value to {nodata_value}"
+            elif transparency is not None:
+                result_msg = f"Set transparency to {transparency}%"
+            elif nodata_value is not None:
+                result_msg = f"Set NODATA value to {nodata_value}"
+            
+            return {"status": "success", "message": result_msg}
+            
+        except Exception as e:
+            error_msg = f"Error in action_set_raster_transparency: {str(e)}"
+            QgsMessageLog.logMessage(error_msg, LOG_TAG, Qgis.Critical)
+            QgsMessageLog.logMessage(traceback.format_exc(), LOG_TAG, Qgis.Critical)
+            return {"status": "error", "message": error_msg}
+
+    @staticmethod
+    def action_list_color_ramps(params):
+        """List all available color ramps in QGIS."""
+        try:
+            style = QgsStyle.defaultStyle()
+            ramp_names = style.colorRampNames()
+            return {
+                "status": "success",
+                "color_ramps": sorted(ramp_names),
+                "count": len(ramp_names)
+            }
+        except Exception as e:
+            error_msg = f"Error listing color ramps: {str(e)}"
+            QgsMessageLog.logMessage(error_msg, LOG_TAG, Qgis.Critical)
+            return {"status": "error", "message": error_msg}
+
+    def action_set_raster_colormap(self, params):
+        """Apply a color ramp to a raster layer."""
+        try:
+            layer_id = params.get("layer_id")
+            layer_name = params.get("layer_name")
+            color_ramp_name = params.get("color_ramp_name")
+            min_value = params.get("min_value")
+            max_value = params.get("max_value")
+            interpolation = params.get("interpolation", "interpolated")
+            band = params.get("band", 1)
+            classes = params.get("classes", 5)  # Number of classes for discrete mode
+            
+            if not color_ramp_name:
+                return {"status": "error", "message": "color_ramp_name is required"}
+            
+            layer, error = self._resolve_layer(layer_id, layer_name, QgsRasterLayer)
+            if not layer:
+                return {"status": "error", "message": error}
+            
+            # Double check type
+            if not isinstance(layer, QgsRasterLayer):
+                return {"status": "error", "message": "Layer is not a raster layer"}
+            
+            # Validate band number
+            if band < 1 or band > layer.bandCount():
+                return {"status": "error", "message": f"Invalid band number {band}. Layer has {layer.bandCount()} bands."}
+            
+            # Get the color ramp from QGIS style
+            style = QgsStyle.defaultStyle()
+            color_ramp = style.colorRamp(color_ramp_name)
+            if not color_ramp:
+                available_ramps = sorted(style.colorRampNames())[:10]
+                return {
+                    "status": "error",
+                    "message": f"Color ramp '{color_ramp_name}' not found. Available ramps include: {', '.join(available_ramps)}..."
+                }
+            
+            # Get min/max values if not provided
+            data_provider = layer.dataProvider()
+            if min_value is None or max_value is None:
+                stats = data_provider.bandStatistics(band, QgsRasterBandStats.All)
+                if min_value is None:
+                    min_value = stats.minimumValue
+                if max_value is None:
+                    max_value = stats.maximumValue
+            
+            min_value = float(min_value)
+            max_value = float(max_value)
+            
+            QgsMessageLog.logMessage(f"Applying colormap '{color_ramp_name}' with range [{min_value}, {max_value}]", LOG_TAG, Qgis.Info)
+            
+            # Create color ramp shader
+            shader = QgsColorRampShader()
+            
+            # Set interpolation type
+            if interpolation.lower() == "discrete":
+                shader.setColorRampType(QgsColorRampShader.Discrete)
+            elif interpolation.lower() == "exact":
+                shader.setColorRampType(QgsColorRampShader.Exact)
+            else:  # interpolated (default)
+                shader.setColorRampType(QgsColorRampShader.Interpolated)
+            
+            # Create color ramp items
+            color_ramp_items = []
+            num_steps = classes if interpolation.lower() == "discrete" else 10
+            
+            for i in range(num_steps + 1):
+                ratio = i / num_steps
+                value = min_value + ratio * (max_value - min_value)
+                color = color_ramp.color(ratio)
+                label = f"{value:.2f}"
+                color_ramp_items.append(QgsColorRampShader.ColorRampItem(value, color, label))
+            
+            shader.setColorRampItemList(color_ramp_items)
+            
+            # Create raster shader
+            raster_shader = QgsRasterShader()
+            raster_shader.setRasterShaderFunction(shader)
+            
+            # Create renderer
+            renderer = QgsSingleBandPseudoColorRenderer(data_provider, band, raster_shader)
+            
+            # Apply renderer to layer
+            layer.setRenderer(renderer)
+            layer.triggerRepaint()
+            self.iface.layerTreeView().refreshLayerSymbology(layer.id())
+            
+            return {
+                "status": "success",
+                "message": f"Applied '{color_ramp_name}' colormap with {interpolation} interpolation",
+                "min_value": min_value,
+                "max_value": max_value,
+                "interpolation": interpolation
+            }
+            
+        except Exception as e:
+            error_msg = f"Error setting raster colormap: {str(e)}"
+            QgsMessageLog.logMessage(error_msg, LOG_TAG, Qgis.Critical)
+            QgsMessageLog.logMessage(traceback.format_exc(), LOG_TAG, Qgis.Critical)
+            return {"status": "error", "message": error_msg}
+
     @staticmethod
     def action_get_layers(params):
         layers = []
@@ -461,7 +728,7 @@ class RequestHandler(QObject):
                 "crs": layer.crs().authid(),
                 "active": (layer.id() == active_layer_id)
             }
-            if layer.type() == QgsMapLayer.VectorLayer:
+            if isinstance(layer, QgsVectorLayer):
                 # Map geometry type enum to string manually to ensure consistency and avoid TypeError
                 g_type = layer.geometryType()
                 if g_type == QgsWkbTypes.PointGeometry:
@@ -512,7 +779,7 @@ class RequestHandler(QObject):
         filter_expression = params.get("filter_expression")
         layer = self._get_layer_by_id(layer_id)
         
-        if not layer or layer.type() != QgsVectorLayer.VectorLayer:
+        if not layer or not isinstance(layer, QgsVectorLayer):
             return {"status": "error", "message": "Invalid vector layer"}
         
         request = QgsFeatureRequest()
@@ -552,6 +819,106 @@ class RequestHandler(QObject):
             return {"status": "success", "result": sanitized_result}
         except Exception as e:
             return {"status": "error", "message": str(e)}
+
+    @staticmethod
+    def action_list_processing_algorithms(params):
+        """List all available processing algorithms with optional search filter."""
+        search = params.get("search", "").lower()
+        limit = params.get("limit", 50)
+        
+        try:
+            from qgis.core import QgsApplication
+            registry = QgsApplication.processingRegistry()
+            all_algorithms = registry.algorithms()
+            
+            results = []
+            for alg in all_algorithms:
+                alg_id = alg.id()
+                alg_name = alg.displayName()
+                alg_group = alg.group()
+                
+                # Filter by search term if provided
+                if search:
+                    if (search not in alg_id.lower() and 
+                        search not in alg_name.lower() and 
+                        search not in alg_group.lower()):
+                        continue
+                
+                results.append({
+                    "id": alg_id,
+                    "name": alg_name,
+                    "group": alg_group
+                })
+                
+                # Apply limit
+                if len(results) >= limit:
+                    break
+            
+            return {
+                "status": "success",
+                "algorithms": results,
+                "count": len(results),
+                "total_available": len(all_algorithms)
+            }
+        except Exception as e:
+            return {"status": "error", "message": str(e), "traceback": traceback.format_exc()}
+
+    @staticmethod
+    def action_get_algorithm_help(params):
+        """Get detailed help for a specific processing algorithm."""
+        algorithm_id = params.get("algorithm_id")
+        
+        if not algorithm_id:
+            return {"status": "error", "message": "algorithm_id is required"}
+        
+        try:
+            from qgis.core import QgsApplication
+            registry = QgsApplication.processingRegistry()
+            alg = registry.algorithmById(algorithm_id)
+            
+            if not alg:
+                return {"status": "error", "message": f"Algorithm '{algorithm_id}' not found"}
+            
+            # Get algorithm information
+            info = {
+                "id": alg.id(),
+                "name": alg.displayName(),
+                "group": alg.group(),
+                "help": alg.shortDescription() if hasattr(alg, 'shortDescription') else "",
+                "parameters": [],
+                "outputs": []
+            }
+            
+            # Get parameter definitions
+            param_defs = alg.parameterDefinitions()
+            for param in param_defs:
+                param_info = {
+                    "name": param.name(),
+                    "description": param.description(),
+                    "type": param.type(),
+                    "optional": not param.flags() & param.FlagOptional == 0,
+                    "default": str(param.defaultValue()) if param.defaultValue() is not None else None
+                }
+                
+                # Add type-specific information
+                if hasattr(param, 'dataType'):
+                    param_info["data_type"] = param.dataType()
+                
+                info["parameters"].append(param_info)
+            
+            # Get output definitions
+            output_defs = alg.outputDefinitions()
+            for output in output_defs:
+                output_info = {
+                    "name": output.name(),
+                    "description": output.description(),
+                    "type": output.type()
+                }
+                info["outputs"].append(output_info)
+            
+            return {"status": "success", "algorithm": info}
+        except Exception as e:
+            return {"status": "error", "message": str(e), "traceback": traceback.format_exc()}
 
     @staticmethod
     def action_save_project(params):
@@ -664,7 +1031,7 @@ class RequestHandler(QObject):
         features_data = params.get("features", []) # List of {"geometry": "WKT...", "attributes": {...}}
         
         layer = self._get_layer_by_id(layer_id)
-        if not layer or layer.type() != QgsVectorLayer.VectorLayer:
+        if not layer or not isinstance(layer, QgsVectorLayer):
             return {"status": "error", "message": "Invalid layer"}
         
         qgs_features = []
@@ -700,7 +1067,7 @@ class RequestHandler(QObject):
         new_layer_name = params.get("new_layer_name", "Extracted Layer")
         
         source_layer = self._get_layer_by_id(source_layer_id)
-        if not source_layer or source_layer.type() != QgsVectorLayer.VectorLayer:
+        if not source_layer or not isinstance(source_layer, QgsVectorLayer):
             return {"status": "error", "message": "Invalid source layer"}
             
         # 1. Create new memory layer with same properties
