@@ -28,6 +28,8 @@ class QGISChatPlugin:
 
     def initGui(self):
         """called when the plugin is loaded"""
+        QgsMessageLog.logMessage("Loading QGIS AI Plugin...", self.log_tag, Qgis.Info)
+        
         icon = self.plugin_dir / "resources" / "logo.png"
         self.action = QAction(QIcon(str(icon)), "AI Assistant", self.iface.mainWindow())
         self.action.triggered.connect(self.open_chat)
@@ -40,22 +42,48 @@ class QGISChatPlugin:
         self.socket_server.start()
         # Start MCP Server (background thread)
         self.start_mcp_server()
+        
+        QgsMessageLog.logMessage("QGIS AI Plugin loaded successfully", self.log_tag, Qgis.Info)
 
     def unload(self):
         """called when the plugin is unloaded"""
+        QgsMessageLog.logMessage("Unloading QGIS AI Plugin...", self.log_tag, Qgis.Info)
+        
         # Stop Socket Server
         if self.socket_server:
+            QgsMessageLog.logMessage("Stopping Socket Server...", self.log_tag, Qgis.Info)
             self.socket_server.stop()
-            self.socket_server.wait()
+            # Use timeout to prevent indefinite waiting if thread is stuck
+            if not self.socket_server.wait(1000):  # 1 seconds timeout (in milliseconds)
+                QgsMessageLog.logMessage("Socket Server did not stop within timeout, continuing anyway", self.log_tag, Qgis.Warning)
+            else:
+                QgsMessageLog.logMessage("Socket Server stopped", self.log_tag, Qgis.Info)
 
         # Stop MCP Server
         if self.mcp_process:
-            self.mcp_process.terminate()
+            QgsMessageLog.logMessage("Stopping MCP Server...", self.log_tag, Qgis.Info)
+            
             try:
-                self.mcp_process.wait(timeout=3)
-            except subprocess.SubprocessError:
-                self.mcp_process.kill()
-                self.mcp_process.wait()
+                # First, try graceful termination
+                self.mcp_process.terminate()
+                try:
+                    # Wait for graceful shutdown with short timeout
+                    self.mcp_process.wait(timeout=1)
+                    QgsMessageLog.logMessage("MCP Server terminated gracefully", self.log_tag, Qgis.Info)
+                except subprocess.TimeoutExpired:
+                    # If timeout, force kill
+                    QgsMessageLog.logMessage("MCP Server did not terminate gracefully, forcing kill...", self.log_tag, Qgis.Warning)
+                    self.mcp_process.kill()
+                    self.mcp_process.wait()  # Wait for kill to complete
+                    QgsMessageLog.logMessage("MCP Server forcefully killed", self.log_tag, Qgis.Info)
+            except Exception as e:
+                QgsMessageLog.logMessage(f"Error stopping MCP Server: {e}", self.log_tag, Qgis.Warning)
+                # Try to kill anyway
+                try:
+                    self.mcp_process.kill()
+                    self.mcp_process.wait()
+                except:
+                    pass
 
             # Close all pipes safely
             for pipe in (self.mcp_process.stdout,
@@ -68,12 +96,15 @@ class QGISChatPlugin:
                     pass
 
             self.mcp_process = None
+            QgsMessageLog.logMessage("MCP Server stopped", self.log_tag, Qgis.Info)
 
         self.iface.removePluginMenu("&QGISChat", self.action)
         self.iface.removeToolBarIcon(self.action)
 
         if self.dock:
             self.iface.removeDockWidget(self.dock)
+        
+        QgsMessageLog.logMessage("QGIS AI Plugin unloaded successfully", self.log_tag, Qgis.Info)
 
     def start_mcp_server(self):
         server_dir = self.plugin_dir / 'server'

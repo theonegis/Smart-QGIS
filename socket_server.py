@@ -310,8 +310,17 @@ class RequestHandler(QObject):
                 sym_layer = symbol.symbolLayer(0)
                 if isinstance(sym_layer, QgsSimpleFillSymbolLayer):
                     if fill_color:
-                        sym_layer.setColor(QColor(fill_color))
+                        # Treat special keywords as a request for no fill, even if fill_style is not set
+                        color_key = str(fill_color).lower()
+                        if color_key in ("transparent", "none", "no_fill", "hollow"):
+                            # Fully transparent fill + no brush = visually no fill
+                            sym_layer.setColor(QColor(0, 0, 0, 0))
+                            sym_layer.setBrushStyle(Qt.NoBrush)
+                        else:
+                            sym_layer.setColor(QColor(fill_color))
                     if fill_style:
+                        # Support both API-style names and natural language synonyms for hollow fill
+                        style_key = fill_style.lower()
                         style_map = {
                             "solid": Qt.SolidPattern,
                             "horizontal": Qt.HorPattern,
@@ -320,10 +329,15 @@ class RequestHandler(QObject):
                             "b_diagonal": Qt.BDiagPattern,
                             "f_diagonal": Qt.FDiagPattern,
                             "diagonal_cross": Qt.DiagCrossPattern,
-                            "no_brush": Qt.NoBrush
+                            "no_brush": Qt.NoBrush,
+                            # natural-language aliases
+                            "hollow": Qt.NoBrush,
+                            "none": Qt.NoBrush,
+                            "no_fill": Qt.NoBrush,
+                            "transparent": Qt.NoBrush,
                         }
-                        if fill_style.lower() in style_map:
-                            sym_layer.setBrushStyle(style_map[fill_style.lower()])
+                        if style_key in style_map:
+                            sym_layer.setBrushStyle(style_map[style_key])
                     if outline_color:
                         sym_layer.setStrokeColor(QColor(outline_color))
                     if outline_width is not None:
@@ -1114,7 +1128,536 @@ class RequestHandler(QObject):
             "feature_count": len(features)
         }
 
+    def _add_grid(self, layout, map_item, interval_x=1.0, interval_y=1.0, crs_authid=None):
+        from qgis.core import QgsLayoutItemMapGrid, QgsCoordinateReferenceSystem
+        from qgis.PyQt.QtGui import QColor
+        
+        grid = QgsLayoutItemMapGrid("Grid 1", map_item)
+        map_item.grids().addGrid(grid)
+        
+        grid.setEnabled(True)
+        grid.setIntervalX(float(interval_x))
+        grid.setIntervalY(float(interval_y))
+        
+        if crs_authid:
+            grid.setCrs(QgsCoordinateReferenceSystem(crs_authid))
+        
+        # Set grid to interior and exterior line style with grey color
+        grid.setFrameStyle(QgsLayoutItemMapGrid.InteriorExteriorTicks)
+        grid.setFramePenColor(QColor("grey"))
+        
+        # Explicitly set grid line color (not just frame)
+        from qgis.core import QgsSimpleLineSymbolLayer, QgsLineSymbol
+        line_symbol = QgsLineSymbol.createSimple({'color': 'grey', 'width': '0.1'})
+        grid.setLineSymbol(line_symbol)
+        
+        # Configure annotations with dynamic precision based on interval
+        grid.setAnnotationEnabled(True)
+        
+        # Calculate precision: if interval is 0.001, we need 3 decimals.
+        # If interval >= 1, we need 0 decimals.
+        import math
+        try:
+            min_interval = min(float(interval_x), float(interval_y))
+            if min_interval <= 0 or math.isnan(min_interval) or math.isinf(min_interval):
+                precision = 1
+            elif min_interval >= 1:
+                precision = 0
+            else:
+                # e.g. 0.1 -> log10(-1) -> 1
+                # e.g. 0.05 -> log10(-1.3) -> 1? No, we need 2 for 0.05 usually?
+                # Actually, for 0.05, 1 decimal is 0.1. So we need 2.
+                # Let's use ceil(abs(log10))
+                precision = int(math.ceil(abs(math.log10(min_interval))))
+        except Exception as e:
+            QgsMessageLog.logMessage(f"Error calculating grid precision: {e}", LOG_TAG, Qgis.Warning)
+            precision = 1
+                
+        grid.setAnnotationPrecision(precision)
+        
+        # Determine CRS to check if geographic
+        grid_crs = grid.crs()
+        if not grid_crs.isValid():
+            grid_crs = map_item.crs()
 
+        if grid_crs.isGeographic():
+            grid.setAnnotationFormat(QgsLayoutItemMapGrid.DecimalWithSuffix)
+        else:
+            grid.setAnnotationFormat(QgsLayoutItemMapGrid.Decimal)
+            
+        # Set annotation direction to Vertical for Left/Right to save space
+        grid.setAnnotationDirection(QgsLayoutItemMapGrid.Vertical, QgsLayoutItemMapGrid.Left)
+        grid.setAnnotationDirection(QgsLayoutItemMapGrid.Vertical, QgsLayoutItemMapGrid.Right)
+        
+        return grid
+
+    def _add_title(self, layout, title_text, font_size=24):
+        from qgis.core import QgsLayoutItemLabel, QgsLayoutPoint, QgsUnitTypes, QgsLayoutItem
+        from qgis.PyQt.QtGui import QFont
+        
+        title = QgsLayoutItemLabel(layout)
+        title.setText(title_text)
+        title.setFont(QFont("SimHei", int(font_size), QFont.Bold))
+        title.setHAlign(Qt.AlignHCenter)
+        title.setVAlign(Qt.AlignVCenter)
+        title.adjustSizeToText()
+        
+        layout.addLayoutItem(title)
+        
+        # Position at top-center
+        title.setReferencePoint(QgsLayoutItem.UpperMiddle)
+        page_width = layout.pageCollection().page(0).pageSize().width()
+        x = page_width / 2
+        y = 5 # 5mm from top
+        title.attemptMove(QgsLayoutPoint(x, y, QgsUnitTypes.LayoutMillimeters))
+        return title
+
+    def _add_scalebar(self, layout, map_item, style="Single Box", position="BottomLeft"):
+        from qgis.core import QgsLayoutItemScaleBar, QgsLayoutPoint, QgsUnitTypes, QgsLayoutItem, QgsDistanceArea, QgsProject, QgsPointXY
+        from qgis.PyQt.QtGui import QFont
+        
+        scalebar = QgsLayoutItemScaleBar(layout)
+        scalebar.setLinkedMap(map_item)
+        scalebar.applyDefaultSize()
+        scalebar.setStyle(style)
+        
+        # Explicitly set height and font size for better visibility
+        # Explicitly set height and font size for better visibility
+        scalebar.setHeight(6) # 6mm height
+        scalebar.setFont(QFont("Arial", 12))
+        scalebar.setFont(QFont("Arial", 12))
+        scalebar.setLabelBarSpace(3) # Space between bar and text
+        
+        # Force Metric Units (Kilometers)
+        scalebar.setUnits(QgsUnitTypes.DistanceKilometers)
+        
+        # Calculate map width in meters using QgsDistanceArea to handle all CRS correctly
+        extent = map_item.extent()
+        crs = map_item.crs()
+        da = QgsDistanceArea()
+        da.setSourceCrs(crs, QgsProject.instance().transformContext())
+        da.setEllipsoid(QgsProject.instance().ellipsoid())
+        
+        # Measure width at the center latitude
+        p1 = QgsPointXY(extent.xMinimum(), extent.center().y())
+        p2 = QgsPointXY(extent.xMaximum(), extent.center().y())
+        width_meters = da.measureLine(p1, p2)
+        
+        # Segment size ~ 1/4 width (larger segments)
+        segment_meters = width_meters / 4.0
+        segment_km = segment_meters / 1000.0
+        
+        nice_segment_km = self._calculate_nice_interval(segment_km)
+        scalebar.setUnitsPerSegment(nice_segment_km)
+        
+        scalebar.setNumberOfSegments(2)  # 2 segments on the right
+        scalebar.setNumberOfSegmentsLeft(0)
+        scalebar.update()
+        
+        layout.addLayoutItem(scalebar)
+        
+        # Position
+        page_size = layout.pageCollection().page(0).pageSize()
+        # Add padding to move it inside the map frame
+        padding = 10 
+        margin_bottom = 30 # Match layout margin
+        margin_left = 30 # Match layout margin
+        
+        if position == "BottomRight":
+            scalebar.setReferencePoint(QgsLayoutItem.LowerRight)
+            x = page_size.width() - margin_left - padding
+            y = page_size.height() - margin_bottom - padding
+        else: # Default BottomLeft
+            scalebar.setReferencePoint(QgsLayoutItem.LowerLeft)
+            x = margin_left + padding
+            y = page_size.height() - margin_bottom - padding
+            
+        scalebar.attemptMove(QgsLayoutPoint(x, y, QgsUnitTypes.LayoutMillimeters))
+        return scalebar
+
+    def _add_legend(self, layout, map_item):
+        from qgis.core import QgsLayoutItemLegend, QgsLayoutPoint, QgsUnitTypes, QgsLayoutItem
+        
+        legend = QgsLayoutItemLegend(layout)
+        if map_item:
+            legend.setLinkedMap(map_item)
+            
+        layout.addLayoutItem(legend)
+        
+        # Position at bottom-right with margin from frame
+        page_size = layout.pageCollection().page(0).pageSize()
+        legend.setReferencePoint(QgsLayoutItem.LowerRight)
+        legend_margin = 20  # mm - increased from 15mm for better separation from frame
+        x = page_size.width() - legend_margin
+        y = page_size.height() - legend_margin
+        legend.attemptMove(QgsLayoutPoint(x, y, QgsUnitTypes.LayoutMillimeters))
+        return legend
+
+    def action_create_print_layout(self, params):
+        # QGIS Print Layout: use QgsPrintLayout/QgsLayout API
+        from datetime import datetime
+        from qgis.core import QgsPrintLayout, QgsLayoutItemMap, QgsProject, QgsLayoutSize, QgsUnitTypes, QgsRectangle
+        
+        layout_mgr = QgsProject.instance().layoutManager()
+        layout_name = params.get("layout_name")
+        map_title = params.get("map_title") or params.get("title")
+        
+        if map_title:
+            # If map title is given, use it as layout name too (override)
+            layout_name = map_title
+        
+        if not layout_name:
+            # Use current datetime as name if not provided
+            layout_name = datetime.now().strftime("Layout-%Y%m%d-%H%M%S")
+        
+        # Remove any existing with same name (QGIS error if duplicate)
+        existing = layout_mgr.layoutByName(layout_name)
+        if existing:
+            layout_mgr.removeLayout(existing)
+
+        layout = QgsPrintLayout(QgsProject.instance())
+        layout.initializeDefaults()
+        layout.setName(layout_name)
+        layout_mgr.addLayout(layout)
+        
+        # 1. Calculate Data Extent from Content Layers (ignore WMS/Basemaps)
+        canvas = self.iface.mapCanvas()
+        visible_layers = canvas.layers()
+        # Force WGS84 as requested to ensure consistent scale bar/grid behavior
+        target_crs = QgsCoordinateReferenceSystem("EPSG:4326")
+        
+        # Filter out WMS/XYZ layers (usually basemaps with global extent)
+        content_layers = [l for l in visible_layers if l.isValid() and l.providerType() != 'wms']
+        
+        full_extent = QgsRectangle()
+        full_extent.setMinimal()
+        has_content_extent = False
+        
+        if content_layers:
+            from qgis.core import QgsCoordinateTransform
+            
+            for layer in content_layers:
+                if not layer.extent().isEmpty():
+                    # Transform extent to Target CRS (WGS84)
+                    layer_extent = layer.extent()
+                    if layer.crs() != target_crs:
+                        try:
+                            transform = QgsCoordinateTransform(layer.crs(), target_crs, QgsProject.instance())
+                            layer_extent = transform.transformBoundingBox(layer.extent())
+                            QgsMessageLog.logMessage(f"Transformed layer {layer.name()} extent to WGS84", LOG_TAG, Qgis.Info)
+                        except Exception as e:
+                            QgsMessageLog.logMessage(f"Failed to transform extent for layer {layer.name()}: {e}", LOG_TAG, Qgis.Warning)
+                    
+                    full_extent.combineExtentWith(layer_extent)
+                    has_content_extent = True
+        
+        if not has_content_extent:
+            full_extent = canvas.extent()
+
+        # 2. Determine Page Size based on Aspect Ratio
+        data_width = full_extent.width()
+        data_height = full_extent.height()
+        
+        if data_height == 0: data_height = 1
+        if data_width == 0: data_width = 1
+        data_ratio = data_width / data_height
+        
+        # Define margins
+        # 2. Determine Page Size based on Aspect Ratio
+        # Use larger margins to accommodate long coordinate labels
+        margin_top = 30
+        margin_bottom = 30
+        margin_left = 30
+        margin_right = 30
+        
+        # Calculate required map area based on data aspect ratio
+        # Start with A4 landscape as base (297mm wide) and calculate height
+        target_width = 297
+        available_width = target_width - margin_left - margin_right
+        available_height = available_width / data_ratio
+        target_height = available_height + margin_top + margin_bottom
+        
+        # Constraints
+        MAX_HEIGHT = 420 # A3 Portrait / A2 Landscape approx
+        MIN_HEIGHT = 148 # A5 Landscape
+        MAX_WIDTH = 420  # A3 Landscape
+        MIN_WIDTH = 148  # A5 Portrait
+        
+        # Check Height Constraints
+        if target_height > MAX_HEIGHT:
+            # Too tall: Fix height to max, recalculate width
+            target_height = MAX_HEIGHT
+            available_height = target_height - margin_top - margin_bottom
+            available_width = available_height * data_ratio
+            target_width = available_width + margin_left + margin_right
+        elif target_height < MIN_HEIGHT:
+            # Too short: Fix height to min, recalculate width
+            target_height = MIN_HEIGHT
+            available_height = target_height - margin_top - margin_bottom
+            available_width = available_height * data_ratio
+            target_width = available_width + margin_left + margin_right
+            
+        # Pass 2: Check Width Constraints (Sanity check)
+        if target_width > MAX_WIDTH:
+            # Too wide: Fix width to max, recalculate height (accepting aspect ratio mismatch if needed, but try to fit)
+            target_width = MAX_WIDTH
+            available_width = target_width - margin_left - margin_right
+            available_height = available_width / data_ratio
+            target_height = available_height + margin_top + margin_bottom
+        elif target_width < MIN_WIDTH:
+             # Too narrow: Fix width to min
+            target_width = MIN_WIDTH
+            available_width = target_width - margin_left - margin_right
+            # Recalculate height to maintain aspect ratio
+            available_height = available_width / data_ratio
+            target_height = available_height + margin_top + margin_bottom
+
+        # Final dimensions
+        page_width = target_width
+        page_height = target_height
+        
+        pc = layout.pageCollection()
+        page = pc.page(0)
+        page.setPageSize(QgsLayoutSize(page_width, page_height, QgsUnitTypes.LayoutMillimeters))
+            
+        # 3. Create Map Item with Margins
+        map_item = QgsLayoutItemMap(layout)
+        
+        x = margin_left
+        y = margin_top
+        w = available_width
+        h = available_height
+        
+        map_item.attemptMove(QgsLayoutPoint(x, y, QgsUnitTypes.LayoutMillimeters))
+        map_item.attemptResize(QgsLayoutSize(w, h, QgsUnitTypes.LayoutMillimeters))
+        map_item.setFrameEnabled(True)
+        map_item.setFrameStrokeWidth(QgsLayoutMeasurement(0.6, QgsUnitTypes.LayoutMillimeters))
+        layout.addLayoutItem(map_item)
+        
+        # 4. Set Map Extent to Data Extent
+        buffered_extent = QgsRectangle(full_extent)
+        buffered_extent.scale(1.05)
+        map_item.zoomToExtent(buffered_extent)
+        map_item.setCrs(target_crs) # Explicitly set map CRS to WGS84
+        map_item.setLayers(visible_layers)
+        
+        # 5. Add Decorations (Automated)
+        
+        # 5. Add Decorations (Automated)
+        
+        # Grid (Smart Interval Calculation)
+        # Calculate X and Y intervals independently to handle long/thin maps
+        map_width_units = buffered_extent.width()
+        map_height_units = buffered_extent.height()
+        
+        interval_x = self._calculate_nice_interval(map_width_units / 5.0)
+        interval_y = self._calculate_nice_interval(map_height_units / 5.0)
+        
+        self._add_grid(layout, map_item, interval_x=interval_x, interval_y=interval_y)
+        
+        # Title
+        title_text = map_title if map_title else "这是标题"
+        self._add_title(layout, title_text)
+        
+        # Scale Bar (Smart Placement)
+        # Heuristic: Check if data centroid is left or right of center
+        # If data is left-heavy, put scale bar on right.
+        # Since we zoom to extent, data is centered.
+        # So we default to Bottom Left, but we can randomize or alternate if needed.
+        # User asked: "depending on where there is much more space"
+        # Since we fit the page to data, space is equal.
+        # We'll default to Bottom Left.
+        self._add_scalebar(layout, map_item, position="BottomLeft")
+        
+        # 6. Open Layout Designer
+        self.iface.openLayoutDesigner(layout)
+        
+        return {
+            "status": "success", 
+            "layout_name": layout_name, 
+            "page_size": f"{page_width:.1f}mm x {page_height:.1f}mm",
+            "aspect_ratio": f"{data_ratio:.2f}"
+        }
+
+    def _get_layout_by_name(self, layout_name):
+        layout_mgr = QgsProject.instance().layoutManager()
+        if layout_name:
+            layout = layout_mgr.layoutByName(layout_name)
+        else:
+            layouts = layout_mgr.printLayouts()
+            layout = layouts[-1] if layouts else None
+        return layout
+
+    def _calculate_nice_interval(self, val):
+        """Calculate a 'nice' grid interval (1, 2, 5, 10, etc.)"""
+        import math
+        # Robust check for NaN, Inf, or Zero
+        if val is None or val <= 0 or math.isnan(val) or math.isinf(val):
+            return 1.0
+        
+        exponent = math.floor(math.log10(val))
+        fraction = val / (10 ** exponent)
+        
+        if fraction < 1.5:
+            nice_fraction = 1
+        elif fraction < 3:
+            nice_fraction = 2
+        elif fraction < 7:
+            nice_fraction = 5
+        else:
+            nice_fraction = 10
+            
+        return nice_fraction * (10 ** exponent)
+
+    def _get_map_item(self, layout):
+        from qgis.core import QgsLayoutItemMap
+        for item in layout.items():
+            if isinstance(item, QgsLayoutItemMap):
+                return item
+        return None
+
+    def action_add_layout_grid(self, params):
+        layout_name = params.get("layout_name")
+        interval_x = params.get("interval_x", 1.0)
+        interval_y = params.get("interval_y", 1.0)
+        crs_authid = params.get("crs")
+        
+        layout = self._get_layout_by_name(layout_name)
+        if not layout: return {"status": "error", "message": "Layout not found"}
+        map_item = self._get_map_item(layout)
+        if not map_item: return {"status": "error", "message": "Map item not found"}
+            
+        self._add_grid(layout, map_item, interval_x, interval_y, crs_authid)
+        layout.refresh()
+        return {"status": "success", "message": "Grid added to layout"}
+
+    def action_add_layout_legend(self, params):
+        layout_name = params.get("layout_name")
+        layout = self._get_layout_by_name(layout_name)
+        if not layout: return {"status": "error", "message": "Layout not found"}
+        map_item = self._get_map_item(layout)
+        
+        self._add_legend(layout, map_item)
+        return {"status": "success", "message": "Legend added to layout"}
+
+    def action_add_layout_scalebar(self, params):
+        layout_name = params.get("layout_name")
+        style = params.get("style", "Single Box")
+        
+        layout = self._get_layout_by_name(layout_name)
+        if not layout: return {"status": "error", "message": "Layout not found"}
+        map_item = self._get_map_item(layout)
+        if not map_item: return {"status": "error", "message": "Map item not found"}
+            
+        self._add_scalebar(layout, map_item, style=style)
+        return {"status": "success", "message": "Scalebar added to layout"}
+
+    def action_add_layout_title(self, params):
+        layout_name = params.get("layout_name")
+        title_text = params.get("title", "Map Title")
+        font_size = params.get("font_size", 24)
+        
+        layout = self._get_layout_by_name(layout_name)
+        if not layout: return {"status": "error", "message": "Layout not found"}
+            
+        self._add_title(layout, title_text, font_size)
+        return {"status": "success", "message": "Title added to layout"}
+
+    def action_export_layout(self, params):
+        """Export a print layout to PDF or image format"""
+        from qgis.core import QgsLayoutExporter
+        import os
+        
+        layout_name = params.get("layout_name")
+        output_path = params.get("output_path")
+        format_type = params.get("format", "png").lower()  # png (default), pdf, jpg, svg
+        dpi = params.get("dpi", 300)
+        
+        # Get layout first (needed for default filename)
+        layout = self._get_layout_by_name(layout_name)
+        if not layout:
+            return {"status": "error", "message": "Layout not found"}
+        
+        # If no output path provided, use Desktop with layout name
+        if not output_path:
+            desktop_path = os.path.expanduser("~/Desktop")
+            layout_name_clean = layout.name().replace(" ", "_")
+            output_path = os.path.join(desktop_path, f"{layout_name_clean}.{format_type}")
+        else:
+            # Expand user path if needed
+            output_path = os.path.expanduser(output_path)
+        
+        try:
+            # Create exporter
+            exporter = QgsLayoutExporter(layout)
+            
+            # Export based on format
+            if format_type == "pdf":
+                # Ensure .pdf extension
+                if not output_path.endswith('.pdf'):
+                    output_path += '.pdf'
+                
+                # Create export settings
+                pdf_settings = QgsLayoutExporter.PdfExportSettings()
+                pdf_settings.dpi = dpi
+                
+                result = exporter.exportToPdf(output_path, pdf_settings)
+                
+            elif format_type in ["png", "jpg", "jpeg"]:
+                # Ensure correct extension
+                if format_type == "jpeg":
+                    format_type = "jpg"
+                if not output_path.endswith(f'.{format_type}'):
+                    output_path += f'.{format_type}'
+                
+                # Create export settings
+                image_settings = QgsLayoutExporter.ImageExportSettings()
+                image_settings.dpi = dpi
+                
+                result = exporter.exportToImage(output_path, image_settings)
+                
+            elif format_type == "svg":
+                # Ensure .svg extension
+                if not output_path.endswith('.svg'):
+                    output_path += '.svg'
+                
+                # Create export settings
+                svg_settings = QgsLayoutExporter.SvgExportSettings()
+                svg_settings.dpi = dpi
+                
+                result = exporter.exportToSvg(output_path, svg_settings)
+                
+            else:
+                return {
+                    "status": "error",
+                    "message": f"Unsupported format: {format_type}. Supported formats: pdf, png, jpg, svg"
+                }
+            
+            # Check result
+            if result == QgsLayoutExporter.Success:
+                return {
+                    "status": "success",
+                    "message": f"Layout exported successfully to {output_path}",
+                    "output_path": output_path,
+                    "format": format_type,
+                    "dpi": dpi
+                }
+            else:
+                error_messages = {
+                    QgsLayoutExporter.FileError: "File error - check permissions and path",
+                    QgsLayoutExporter.PrintError: "Print error",
+                    QgsLayoutExporter.MemoryError: "Memory error - try reducing DPI",
+                    QgsLayoutExporter.IteratorError: "Iterator error",
+                    QgsLayoutExporter.Canceled: "Export was canceled"
+                }
+                error_msg = error_messages.get(result, f"Unknown error code: {result}")
+                return {"status": "error", "message": f"Export failed: {error_msg}"}
+                
+        except Exception as e:
+            return {"status": "error", "message": f"Export error: {str(e)}", "traceback": traceback.format_exc()}
+
+
+        
 class QgisSocketServer(QtCore.QThread):
     def __init__(self, handler, host='localhost', port=9876):
         super().__init__()
@@ -1129,6 +1672,7 @@ class QgisSocketServer(QtCore.QThread):
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.socket.settimeout(1.0)  # 1 second timeout to prevent indefinite blocking
             self.socket.bind((self.host, self.port))
             self.socket.listen(1)
             QgsMessageLog.logMessage(f"QGIS Socket Server listening on {self.host}:{self.port}", LOG_TAG, Qgis.Info)
@@ -1137,24 +1681,31 @@ class QgisSocketServer(QtCore.QThread):
                 try:
                     conn, addr = self.socket.accept()
                     with conn:
-                        data = b''
                         while True:
-                            chunk = conn.recv(4096)
-                            if not chunk:
-                                break
-                            data += chunk
-                            try:
-                                json_obj = json.loads(data.decode('utf-8'))
-                                break
-                            except json.JSONDecodeError:
-                                continue
+                            data = b''
+                            message_complete = False
+                            while True:
+                                chunk = conn.recv(4096)
+                                if not chunk:
+                                    break
+                                data += chunk
+                                try:
+                                    json_obj = json.loads(data.decode('utf-8'))
+                                    message_complete = True
+                                    break
+                                except json.JSONDecodeError:
+                                    continue
 
-                        if not data:
-                            continue
-                        # Process request
-                        response = self.process_request(json_obj)
-                        # Send response
-                        conn.sendall(json.dumps(response).encode('utf-8'))
+                            if not data or not message_complete:
+                                break
+                                
+                            # Process request
+                            response = self.process_request(json_obj)
+                            # Send response
+                            conn.sendall(json.dumps(response).encode('utf-8'))
+                except socket.timeout:
+                    # Timeout on accept() - this is normal, just check running flag and continue
+                    continue
                 except OSError:
                     break
                 except Exception as e:
