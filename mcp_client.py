@@ -58,7 +58,7 @@ class McpClient:
                 QgsMessageLog.logMessage(f"Error reading from MCP server stdout: {e}", LOG_TAG, Qgis.Critical)
                 break
 
-    def send_request(self, method, params=None):
+    def send_request(self, method, params=None, timeout=10):
         future = Future()
         with self.lock:
             self.request_id += 1
@@ -79,7 +79,7 @@ class McpClient:
         
         # Wait for response using Future
         try:
-            return future.result(timeout=10)
+            return future.result(timeout=timeout)
         except Exception as e:
             QgsMessageLog.logMessage(f"MCP request failed or timed out: {e}", LOG_TAG, Qgis.Critical)
             with self.lock:
@@ -98,8 +98,9 @@ class McpClient:
         response = self.send_request("tools/list")
         return response.get("tools", [])
 
-    def call_tool(self, name, arguments):
+    def call_tool(self, name, arguments, timeout=600):
+        # Default timeout for tools is 10 minutes (600s) to allow for long running operations
         return self.send_request("tools/call", {
             "name": name,
             "arguments": arguments
-        })
+        }, timeout=timeout)

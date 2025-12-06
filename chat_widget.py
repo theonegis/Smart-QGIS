@@ -335,11 +335,11 @@ class ChatDockWidget(QtWidgets.QDockWidget):
             {
                 "role": "system",
                 "content": (
-                    "You are a helpful QGIS AI assistant. You can help users with GIS-related tasks and can use various tools to interact with the QGIS application.\n"
-                    "IMPORTANT: If the user's request is missing specific parameters (like layer names, file paths, or field names), try to INFER them from the context.\n"
-                    "- If a layer name is missing, check if a layer was recently mentioned or added. If not, use a reasonable default like 'Output Layer'.\n"
-                    "- If a file path is missing for saving, default to the user's Desktop directory or a temporary location.\n"
-                    "- If a filter expression is needed but not fully specified, try to construct a valid QGIS expression based on the user's intent (e.g., \"name\" = 'Value')."
+                    "你是一个地理信息与遥感专家，作为精通QGIS人工智能助手，你能够协助用户完成各类空间数据处理、分析与制图的相关任务，并可调用多种工具与 QGIS应用程序进行交互.\n"
+                    "IMPORTANT: 若用户请求中缺失特定参数（如图层名称、文件路径或字段名称），请尝试从上下文信息中推导补全.\n"
+                    "- 若图层名称缺失，核查是否存在近期提及或添加的图层，默认可以使用当前活动图层；对于输出结果图层，若无相关信息，则采用合理默认值（例如'结果图层'）.\n"
+                    "- 若文件路径缺失，核查是否存在近期提及或添加的文件路径，若无相关信息，则采用合理默认值（例如用户主目录下的Desktop目录或临时位置）.文件名称若没有指定，则可根据操作名称或输入数据名称进行合理推导.\n"
+                    "- 若需使用筛选表达式但用户未完整指定，可根据用户意图构建有效的 QGIS表达式（例如\"name\"='Value'）."
                 )
             }
         ]  # Keep track of conversation history
@@ -347,7 +347,7 @@ class ChatDockWidget(QtWidgets.QDockWidget):
         initial_greeting = (
             '<div style="margin: 10px 0">'
             '<span style="background-color:#90EE90; border-radius:10px; padding:10px; display:inline-block;">'
-            '<strong>AI Assistant:</strong><br/>Hello! I\'m your QGIS AI assistant. How can I help you with your GIS projects today?</span></div>'
+            '<strong>AI智能体:</strong><br/>你好！我是QGIS AI智能体，很高兴与你交流。我能够帮助你完成各类空间数据处理、分析与制图的相关任务，并可调用多种工具与QGIS应用程序进行交互。有什么问题，我将竭诚为你服务。</span></div>'
         )
         self.txt_history.append(initial_greeting)
         self.setObjectName("QGIS AI Assistant Dock")
@@ -412,14 +412,14 @@ class ChatDockWidget(QtWidgets.QDockWidget):
         user_html = (
             f'<div style="margin: 10px 0">'
             f'<span style="background-color:#90D5FF; border-radius:10px; padding:10px; display:inline-block;">'
-            f'<strong>You:</strong><br/>{text}</span></div>'
+            f'<strong>用户:</strong><br/>{text}</span></div>'
         )
         self.txt_history.append(user_html)
         self.txt_input.clear()
         # Prepare AI response area
         ai_html = (
             f'<div style="margin: 10px 0">'
-            f'<strong>AI: </strong><br/></div>'
+            f'<strong>AI智能体: </strong><br/></div>'
         )
         self.txt_history.append(ai_html)
         self.txt_history.moveCursor(QTextCursor.End)

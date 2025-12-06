@@ -130,6 +130,7 @@ class RequestHandler(QObject):
         else:
             return {"status": "error", "message": "Failed to load layer"}
 
+
     def action_add_raster_layer(self, params):
         import os
         path = params.get("path")
@@ -567,15 +568,34 @@ class RequestHandler(QObject):
                 if band < 1 or band > layer.bandCount():
                     return {"status": "error", "message": f"Invalid band number {band}. Layer has {layer.bandCount()} bands."}
                 
-                # Set user-defined NODATA value
+                # Set user-defined NODATA value on the data provider
                 # Create a range for the exact value
                 nodata_ranges = [QgsRasterRange(float(nodata_value), float(nodata_value))]
                 success = data_provider.setUserNoDataValue(band, nodata_ranges)
                 
                 if success:
-                    QgsMessageLog.logMessage(f"Set NODATA value {nodata_value} for band {band}", LOG_TAG, Qgis.Info)
+                    QgsMessageLog.logMessage(f"Set NODATA value {nodata_value} for band {band} on data provider", LOG_TAG, Qgis.Info)
                 else:
-                    QgsMessageLog.logMessage(f"Failed to set NODATA value for band {band}", LOG_TAG, Qgis.Warning)
+                    QgsMessageLog.logMessage(f"Failed to set NODATA value for band {band} on data provider", LOG_TAG, Qgis.Warning)
+                
+                # CRITICAL: Also configure the renderer's transparency to make nodata pixels transparent
+                renderer = layer.renderer()
+                if renderer:
+                    # Create or get existing raster transparency
+                    raster_transparency = QgsRasterTransparency()
+                    
+                    # Add transparent pixel for the exact nodata value
+                    transparent_pixels = []
+                    transparent_pixel = QgsRasterTransparency.TransparentSingleValuePixel()
+                    transparent_pixel.min = float(nodata_value)
+                    transparent_pixel.max = float(nodata_value)
+                    transparent_pixel.percentTransparent = 100.0  # Fully transparent
+                    transparent_pixels.append(transparent_pixel)
+                    
+                    raster_transparency.setTransparentSingleValuePixelList(transparent_pixels)
+                    renderer.setRasterTransparency(raster_transparency)
+                    
+                    QgsMessageLog.logMessage(f"Configured renderer transparency for nodata value {nodata_value}", LOG_TAG, Qgis.Info)
                 
                 # Refresh the layer to apply changes
                 layer.dataProvider().reloadData()
@@ -821,7 +841,67 @@ class RequestHandler(QObject):
         parameters = params.get("parameters", {})
 
         try:
-            result = processing.run(algorithm, parameters)
+            # Resolve layer IDs / Names / Paths to layer objects where appropriate
+            # QGIS processing algorithms often require QgsMapLayer objects for layer inputs.
+            # We implement a smart resolution strategy:
+            # 1. Check if it's already a Layer Object (internal use) -> Use it.
+            # 2. Check if string is a Layer ID -> Map to Layer Object.
+            # 3. Check if string is a valid File Path -> Keep as String (QGIS handles paths).
+            # 4. Check if string matches a Layer Name (fuzzy) -> Map to Layer Object.
+            # 5. Fallback -> Keep as String (might be a number or option string).
+            
+            resolved_params = {}
+            import os
+            
+            # Helper to find layer by name
+            def find_layer_by_name(name):
+                # Fuzzy match case-insensitive
+                layers = QgsProject.instance().mapLayers().values()
+                for l in layers:
+                    if l.name().lower() == name.lower():
+                        return l
+                return None
+
+            for key, value in parameters.items():
+                QgsMessageLog.logMessage(f"Resolving parameter '{key}': {value}", LOG_TAG, Qgis.Info)
+                
+                # Check if value is already a QgsMapLayer object
+                if isinstance(value, QgsMapLayer):
+                    resolved_params[key] = value
+                    QgsMessageLog.logMessage(f"  -> Kept as Layer Object: {value.name()}", LOG_TAG, Qgis.Info)
+                    
+                elif isinstance(value, str):
+                    # 1. Try as Layer ID
+                    layer_by_id = QgsProject.instance().mapLayer(value)
+                    if layer_by_id:
+                        resolved_params[key] = layer_by_id
+                        QgsMessageLog.logMessage(f"  -> Resolved ID to Layer: {layer_by_id.name()}", LOG_TAG, Qgis.Info)
+                        continue
+                        
+                    # 2. Try as File Path
+                    # Check if it looks like a path and exists
+                    if (os.path.isabs(value) or "/" in value or "\\" in value) and os.path.exists(value):
+                        resolved_params[key] = value
+                        QgsMessageLog.logMessage(f"  -> Identified as existing file path", LOG_TAG, Qgis.Info)
+                        continue
+                     
+                    # 3. Try as Layer Name
+                    layer_by_name = find_layer_by_name(value)
+                    if layer_by_name:
+                        resolved_params[key] = layer_by_name
+                        QgsMessageLog.logMessage(f"  -> Resolved Name to Layer: {layer_by_name.name()}", LOG_TAG, Qgis.Info)
+                        continue
+                        
+                    # 4. Fallback
+                    resolved_params[key] = value
+                    QgsMessageLog.logMessage(f"  -> Kept as string", LOG_TAG, Qgis.Info)
+                    
+                else:
+                    # Other types (int, float, bool, dict, list, etc.), keep as-is
+                    resolved_params[key] = value
+            
+            result = processing.run(algorithm, resolved_params)
+            
             # Result might contain QgsMapLayer objects, which are not serializable.
             # We need to sanitize the result.
             sanitized_result = {}
@@ -830,9 +910,19 @@ class RequestHandler(QObject):
                     sanitized_result[k] = v.id()
                 else:
                     sanitized_result[k] = str(v)  # Fallback to string
-            return {"status": "success", "result": sanitized_result}
+                    
+            # Log the full result for debugging
+            QgsMessageLog.logMessage(f"Algorithm '{algorithm}' finished. Result: {json.dumps(sanitized_result)}", LOG_TAG, Qgis.Info)
+            
+            return {
+                "status": "success", 
+                "result": sanitized_result,
+                "message": f"Algorithm {algorithm} executed successfully. Outputs: {', '.join(sanitized_result.keys())}"
+            }
         except Exception as e:
-            return {"status": "error", "message": str(e)}
+            error_msg = f"Algorithm execution failed: {str(e)}"
+            QgsMessageLog.logMessage(error_msg, LOG_TAG, Qgis.Critical)
+            return {"status": "error", "message": error_msg}
 
     @staticmethod
     def action_list_processing_algorithms(params):
@@ -991,12 +1081,20 @@ class RequestHandler(QObject):
         code = params.get("code")
         try:
             # Execute in a restricted scope, but with access to iface/qgis
+            # IMPORTANT: After modifying layer styles, you MUST call:
+            # iface.layerTreeView().refreshLayerSymbology(layer_id)
             local_scope = {
                 "iface": self.iface, 
                 "QgsProject": QgsProject, 
                 "QgsApplication": QgsApplication,
                 "QColor": QColor,
-                "QgsWkbTypes": QgsWkbTypes
+                "QgsWkbTypes": QgsWkbTypes,
+                "QgsSimpleFillSymbolLayer": QgsSimpleFillSymbolLayer,
+                "QgsSimpleLineSymbolLayer": QgsSimpleLineSymbolLayer,
+                "QgsSimpleMarkerSymbolLayer": QgsSimpleMarkerSymbolLayer,
+                "QgsFillSymbol": QgsFillSymbol,
+                "QgsLineSymbol": QgsLineSymbol,
+                "QgsMarkerSymbol": QgsMarkerSymbol,
             }
             exec(code, globals(), local_scope)
             return {"status": "success"}
@@ -1195,21 +1293,43 @@ class RequestHandler(QObject):
         from qgis.core import QgsLayoutItemLabel, QgsLayoutPoint, QgsUnitTypes, QgsLayoutItem
         from qgis.PyQt.QtGui import QFont
         
-        title = QgsLayoutItemLabel(layout)
-        title.setText(title_text)
-        title.setFont(QFont("SimHei", int(font_size), QFont.Bold))
-        title.setHAlign(Qt.AlignHCenter)
-        title.setVAlign(Qt.AlignVCenter)
-        title.adjustSizeToText()
+        # Check if a title label already exists at the top center
+        existing_title = None
+        for item in layout.items():
+            if isinstance(item, QgsLayoutItemLabel):
+                # Check if this label is positioned at top-center (likely a title)
+                # We consider it a title if it's within 10mm of the top
+                pos = item.pagePos()
+                if pos.y() < 10:  # Within 10mm from top
+                    existing_title = item
+                    break
         
-        layout.addLayoutItem(title)
+        if existing_title:
+            # Update existing title
+            title = existing_title
+            title.setText(title_text)
+            title.setFont(QFont("SimHei", int(font_size), QFont.Bold))
+            title.adjustSizeToText()
+            QgsMessageLog.logMessage(f"Updated existing title to: {title_text}", LOG_TAG, Qgis.Info)
+        else:
+            # Create new title
+            title = QgsLayoutItemLabel(layout)
+            title.setText(title_text)
+            title.setFont(QFont("SimHei", int(font_size), QFont.Bold))
+            title.setHAlign(Qt.AlignHCenter)
+            title.setVAlign(Qt.AlignVCenter)
+            title.adjustSizeToText()
+            
+            layout.addLayoutItem(title)
+            
+            # Position at top-center
+            title.setReferencePoint(QgsLayoutItem.UpperMiddle)
+            page_width = layout.pageCollection().page(0).pageSize().width()
+            x = page_width / 2
+            y = 5 # 5mm from top
+            title.attemptMove(QgsLayoutPoint(x, y, QgsUnitTypes.LayoutMillimeters))
+            QgsMessageLog.logMessage(f"Created new title: {title_text}", LOG_TAG, Qgis.Info)
         
-        # Position at top-center
-        title.setReferencePoint(QgsLayoutItem.UpperMiddle)
-        page_width = layout.pageCollection().page(0).pageSize().width()
-        x = page_width / 2
-        y = 5 # 5mm from top
-        title.attemptMove(QgsLayoutPoint(x, y, QgsUnitTypes.LayoutMillimeters))
         return title
 
     def _add_scalebar(self, layout, map_item, style="Single Box", position="BottomLeft"):
@@ -1561,7 +1681,7 @@ class RequestHandler(QObject):
         if not layout: return {"status": "error", "message": "Layout not found"}
             
         self._add_title(layout, title_text, font_size)
-        return {"status": "success", "message": "Title added to layout"}
+        return {"status": "success", "message": f"Title set to: {title_text}"}
 
     def action_export_layout(self, params):
         """Export a print layout to PDF or image format"""
