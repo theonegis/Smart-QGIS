@@ -115,7 +115,6 @@ class QGISChatPlugin:
             possible_path = Path(f"~/.local/bin/uv{'.exe' if os.name == 'nt' else ''}").expanduser()
             if possible_path.exists():
                 uv_path = str(possible_path)
-            if os.path.exists(uv_path):
                 QgsMessageLog.logMessage(f"uv path: {uv_path}", self.log_tag, Qgis.Info)
 
         if not uv_path:
