@@ -23,102 +23,151 @@ class QGISChatPlugin:
         self.socket_server = None
         self.handler = None
         self.mcp_client = None
-        self.mcp_client = None
         self.mcp_process = None
 
     def initGui(self):
         """called when the plugin is loaded"""
         QgsMessageLog.logMessage("Loading QGIS AI Plugin...", self.log_tag, Qgis.Info)
-        
+
         icon = self.plugin_dir / "resources" / "logo.png"
         self.action = QAction(QIcon(str(icon)), "AI Assistant", self.iface.mainWindow())
         self.action.triggered.connect(self.open_chat)
         self.iface.addPluginToMenu("&QGISChat", self.action)
         self.iface.addToolBarIcon(self.action)
 
-        # Start Socket Server
-        self.handler = RequestHandler(self.iface)
-        self.socket_server = QgisSocketServer(self.handler)
-        self.socket_server.start()
-        # Start MCP Server (background thread)
+        # Start Servers
+        self.start_socket_server()
         self.start_mcp_server()
-        
-        QgsMessageLog.logMessage("QGIS AI Plugin loaded successfully", self.log_tag, Qgis.Info)
+
+        QgsMessageLog.logMessage(
+            "QGIS AI Plugin loaded successfully", self.log_tag, Qgis.Info
+        )
+
+    def is_socket_server_running(self):
+        return self.socket_server is not None and self.socket_server.isRunning()
+
+    def is_mcp_server_running(self):
+        return self.mcp_process is not None and self.mcp_process.poll() is None
+
+    def start_socket_server(self):
+        if self.socket_server:
+            QgsMessageLog.logMessage(
+                "Socket Server already running", self.log_tag, Qgis.Warning
+            )
+            return
+
+        QgsMessageLog.logMessage("Starting Socket Server...", self.log_tag, Qgis.Info)
+        try:
+            self.handler = RequestHandler(self.iface)
+            self.socket_server = QgisSocketServer(self.handler)
+            self.socket_server.start()
+            QgsMessageLog.logMessage("Socket Server started", self.log_tag, Qgis.Info)
+        except Exception as e:
+            QgsMessageLog.logMessage(
+                f"Failed to start Socket Server: {e}", self.log_tag, Qgis.Critical
+            )
+
+    def stop_socket_server(self):
+        if not self.socket_server:
+            return
+
+        QgsMessageLog.logMessage("Stopping Socket Server...", self.log_tag, Qgis.Info)
+        self.socket_server.stop()
+        if not self.socket_server.wait(1000):
+            QgsMessageLog.logMessage(
+                "Socket Server did not stop within timeout", self.log_tag, Qgis.Warning
+            )
+        else:
+            QgsMessageLog.logMessage("Socket Server stopped", self.log_tag, Qgis.Info)
+        self.socket_server = None
+
+    def stop_mcp_server(self):
+        if not self.mcp_process:
+            return
+
+        QgsMessageLog.logMessage("Stopping MCP Server...", self.log_tag, Qgis.Info)
+        try:
+            self.mcp_process.terminate()
+            try:
+                self.mcp_process.wait(timeout=1)
+                QgsMessageLog.logMessage(
+                    "MCP Server terminated gracefully", self.log_tag, Qgis.Info
+                )
+            except subprocess.TimeoutExpired:
+                self.mcp_process.kill()
+                self.mcp_process.wait()
+                QgsMessageLog.logMessage(
+                    "MCP Server forcefully killed", self.log_tag, Qgis.Info
+                )
+        except Exception as e:
+            QgsMessageLog.logMessage(
+                f"Error stopping MCP Server: {e}", self.log_tag, Qgis.Warning
+            )
+            try:
+                self.mcp_process.kill()
+                self.mcp_process.wait()
+            except:
+                pass
+
+        # Close pipes
+        for pipe in (
+            self.mcp_process.stdout,
+            self.mcp_process.stderr,
+            self.mcp_process.stdin,
+        ):
+            try:
+                if pipe and not pipe.closed:
+                    pipe.close()
+            except:
+                pass
+
+        self.mcp_process = None
+        self.mcp_client = None
+        # Notify dock if it exists
+        if self.dock:
+            self.dock.on_mcp_server_changed(None)
 
     def unload(self):
         """called when the plugin is unloaded"""
         QgsMessageLog.logMessage("Unloading QGIS AI Plugin...", self.log_tag, Qgis.Info)
-        
+
         # Stop Socket Server
-        if self.socket_server:
-            QgsMessageLog.logMessage("Stopping Socket Server...", self.log_tag, Qgis.Info)
-            self.socket_server.stop()
-            # Use timeout to prevent indefinite waiting if thread is stuck
-            if not self.socket_server.wait(1000):  # 1 seconds timeout (in milliseconds)
-                QgsMessageLog.logMessage("Socket Server did not stop within timeout, continuing anyway", self.log_tag, Qgis.Warning)
-            else:
-                QgsMessageLog.logMessage("Socket Server stopped", self.log_tag, Qgis.Info)
-
-        # Stop MCP Server
-        if self.mcp_process:
-            QgsMessageLog.logMessage("Stopping MCP Server...", self.log_tag, Qgis.Info)
-            
-            try:
-                # First, try graceful termination
-                self.mcp_process.terminate()
-                try:
-                    # Wait for graceful shutdown with short timeout
-                    self.mcp_process.wait(timeout=1)
-                    QgsMessageLog.logMessage("MCP Server terminated gracefully", self.log_tag, Qgis.Info)
-                except subprocess.TimeoutExpired:
-                    # If timeout, force kill
-                    QgsMessageLog.logMessage("MCP Server did not terminate gracefully, forcing kill...", self.log_tag, Qgis.Warning)
-                    self.mcp_process.kill()
-                    self.mcp_process.wait()  # Wait for kill to complete
-                    QgsMessageLog.logMessage("MCP Server forcefully killed", self.log_tag, Qgis.Info)
-            except Exception as e:
-                QgsMessageLog.logMessage(f"Error stopping MCP Server: {e}", self.log_tag, Qgis.Warning)
-                # Try to kill anyway
-                try:
-                    self.mcp_process.kill()
-                    self.mcp_process.wait()
-                except:
-                    pass
-
-            # Close all pipes safely
-            for pipe in (self.mcp_process.stdout,
-                         self.mcp_process.stderr,
-                         self.mcp_process.stdin):
-                try:
-                    if pipe and not pipe.closed:
-                        pipe.close()
-                except (OSError, subprocess.ProcessError):
-                    pass
-
-            self.mcp_process = None
-            QgsMessageLog.logMessage("MCP Server stopped", self.log_tag, Qgis.Info)
+        self.stop_socket_server()
+        self.stop_mcp_server()
 
         self.iface.removePluginMenu("&QGISChat", self.action)
         self.iface.removeToolBarIcon(self.action)
 
         if self.dock:
             self.iface.removeDockWidget(self.dock)
-        
-        QgsMessageLog.logMessage("QGIS AI Plugin unloaded successfully", self.log_tag, Qgis.Info)
+
+        QgsMessageLog.logMessage(
+            "QGIS AI Plugin unloaded successfully", self.log_tag, Qgis.Info
+        )
 
     def start_mcp_server(self):
-        server_dir = self.plugin_dir / 'server'
-        mcp_script = 'mcp_server.py'
+        if self.mcp_process:
+            QgsMessageLog.logMessage(
+                "MCP Server already running", self.log_tag, Qgis.Warning
+            )
+            return
+
+        server_dir = self.plugin_dir / "server"
+        mcp_script = "mcp_server.py"
         # Find uv executable
         uv_path = shutil.which("uv")
         if not uv_path:
-            possible_path = Path(f"~/.local/bin/uv{'.exe' if os.name == 'nt' else ''}").expanduser()
+            possible_path = Path(
+                f"~/.local/bin/uv{'.exe' if os.name == 'nt' else ''}"
+            ).expanduser()
             if possible_path.exists():
                 uv_path = str(possible_path)
                 QgsMessageLog.logMessage(f"uv path: {uv_path}", self.log_tag, Qgis.Info)
 
         if not uv_path:
-            self.on_mcp_server_error("uv executable not found. Please install uv or ensure it is in your system PATH.")
+            self.on_mcp_server_error(
+                "uv executable not found. Please install uv or ensure it is in your system PATH."
+            )
             return
 
         try:
@@ -129,21 +178,40 @@ class QGISChatPlugin:
             env = os.environ.copy()
             env.pop("PYTHONHOME", None)
             env.pop("PYTHONPATH", None)
-            
+
             # Check if .venv exists, if not run uv sync
             venv_path = server_dir / ".venv"
             if not venv_path.exists():
-                QgsMessageLog.logMessage("Virtual environment not found. Initializing with uv sync...", self.log_tag, Qgis.Info)
+                QgsMessageLog.logMessage(
+                    "Virtual environment not found. Initializing with uv sync...",
+                    self.log_tag,
+                    Qgis.Info,
+                )
                 sync_cmd = [uv_path, "sync"]
                 try:
-                    subprocess.run(sync_cmd, cwd=str(server_dir), env=env, check=True, capture_output=True, text=True)
-                    QgsMessageLog.logMessage("Virtual environment initialized successfully.", self.log_tag, Qgis.Info)
+                    subprocess.run(
+                        sync_cmd,
+                        cwd=str(server_dir),
+                        env=env,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                    QgsMessageLog.logMessage(
+                        "Virtual environment initialized successfully.",
+                        self.log_tag,
+                        Qgis.Info,
+                    )
                 except subprocess.CalledProcessError as e:
-                    self.on_mcp_server_error(f"Failed to initialize virtual environment: {e.stderr}")
+                    self.on_mcp_server_error(
+                        f"Failed to initialize virtual environment: {e.stderr}"
+                    )
                     return
 
             cmd = [uv_path, "run", mcp_script]
-            QgsMessageLog.logMessage(f"Starting MCP Server with uv: {cmd}", self.log_tag, Qgis.Info)
+            QgsMessageLog.logMessage(
+                f"Starting MCP Server with uv: {cmd}", self.log_tag, Qgis.Info
+            )
 
             process = subprocess.Popen(
                 cmd,
@@ -153,9 +221,11 @@ class QGISChatPlugin:
                 stdin=subprocess.PIPE,
                 text=True,
                 bufsize=1,
-                env=env
+                env=env,
             )
-            QgsMessageLog.logMessage(f"Started MCP Server with PID {process.pid}", self.log_tag, Qgis.Info)
+            QgsMessageLog.logMessage(
+                f"Started MCP Server with PID {process.pid}", self.log_tag, Qgis.Info
+            )
             self.on_mcp_server_started(process)
 
         except Exception as e:
@@ -167,16 +237,24 @@ class QGISChatPlugin:
         try:
             self.mcp_client = McpClient(self.mcp_process)
             QgsMessageLog.logMessage("MCP Client initialized", self.log_tag, Qgis.Info)
+            # Notify dock if it exists
+            if self.dock:
+                self.dock.on_mcp_server_changed(self.mcp_client)
         except Exception as e:
             self.on_mcp_server_error(f"Failed to initialize MCP Client: {e}")
+            # Ensure we clean up the process if client init fails
+            self.stop_mcp_server()
 
     def on_mcp_server_error(self, error_msg):
         QgsMessageLog.logMessage(error_msg, self.log_tag, Qgis.Critical)
-        self.iface.messageBar().pushMessage("Error", error_msg, level=3)
+        # self.iface.messageBar().pushMessage("Error", error_msg, level=3)
 
     def open_chat(self):
         if not self.dock:
-            self.dock = ChatDockWidget(self.mcp_client, self.iface.mainWindow())
+            self.dock = ChatDockWidget(self.iface.mainWindow())
+            # Connect the signals or pass callbacks
+            self.dock.set_server_controller(self)
+            self.dock.on_mcp_server_changed(self.mcp_client)
             self.iface.addDockWidget(QtCore.Qt.RightDockWidgetArea, self.dock)
 
         self.dock.show()
