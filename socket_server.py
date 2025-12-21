@@ -4,9 +4,10 @@ import threading
 import traceback
 from qgis.core import *
 from qgis import processing
-from qgis.PyQt import QtCore, QtGui
+from qgis.PyQt import QtCore, QtGui, QtWidgets
 from qgis.PyQt.QtCore import *
 from qgis.PyQt.QtGui import *
+from qgis.PyQt.QtWidgets import QProgressBar
 
 """
 1. MCP Server sends JSON: {"type": "zoom_to_layer", ...}
@@ -18,7 +19,7 @@ from qgis.PyQt.QtGui import *
 7. SocketServer sends JSON response back to MCP.
 """
 
-LOG_TAG = "QGIS AI"
+LOG_TAG = "Smart QGIS"
 
 
 class RequestHandler(QObject):
@@ -28,6 +29,8 @@ class RequestHandler(QObject):
     def __init__(self, iface):
         super().__init__()
         self.iface = iface
+        self._active_tasks = []
+        self._task_refs = {}
         # Connect signal to slot with QueuedConnection to ensure it runs on main thread
         self.sig_handle_request.connect(self.slot_handle_request, Qt.QueuedConnection)
 
@@ -62,9 +65,9 @@ class RequestHandler(QObject):
 
             # Special case for processing: run in background task to avoid UI freeze
             if cmd_type == "execute_processing":
+                # For processing, we offload to a QTask and wait for it to finish asynchronously
+                # The event.set() will be called by the task completion callback
                 self.run_algorithm_background(command, event, result_container)
-                # We return immediately, but we DO NOT set event.set().
-                # The background task completion will call event.set().
             else:
                 result = self.handle_request(command)
                 result_container["result"] = result
@@ -76,63 +79,6 @@ class RequestHandler(QObject):
                 "message": f"Slot error: {str(e)}",
             }
             event.set()
-
-    def run_algorithm_background(self, command, event, result_container):
-        """Starts a QGIS Task to run the algorithm without blocking the UI."""
-        params = command.get("params", {})
-        algorithm = params.get("algorithm")
-        alg_params = params.get("parameters", {})
-
-        # We need to resolve parameters on the main thread before starting the task
-        resolved_params = self.resolve_processing_params(alg_params)
-
-        from qgis.core import (
-            QgsProcessingAlgRunnerTask,
-            QgsApplication,
-            QgsProcessingContext,
-            QgsProcessingFeedback,
-        )
-
-        context = QgsProcessingContext()
-        feedback = QgsProcessingFeedback()
-
-        task = QgsProcessingAlgRunnerTask(algorithm, resolved_params, context, feedback)
-
-        def on_finished(success):
-            try:
-                if success:
-                    # Get results from task
-                    results = task.results()
-                    # Sanitize results
-                    sanitized = {}
-                    for k, v in results.items():
-                        if hasattr(v, "id"):
-                            sanitized[k] = v.id()
-                        else:
-                            sanitized[k] = str(v)
-                    result_container["result"] = {
-                        "status": "success",
-                        "result": sanitized,
-                    }
-                else:
-                    result_container["result"] = {
-                        "status": "error",
-                        "message": "Processing task failed. Check QGIS logs for details.",
-                    }
-            except Exception as e:
-                result_container["result"] = {
-                    "status": "error",
-                    "message": f"Error finishing task: {e}",
-                }
-            finally:
-                # IMPORTANT: Set event to wake up the waiting socket thread
-                event.set()
-
-        task.executed.connect(on_finished)
-        QgsApplication.taskManager().addTask(task)
-        QgsMessageLog.logMessage(
-            f"Started background task for algorithm: {algorithm}", LOG_TAG, Qgis.Info
-        )
 
     def resolve_processing_params(self, parameters):
         """Helper to resolve layer names/paths to objects (must be called on main thread)."""
@@ -152,7 +98,7 @@ class RequestHandler(QObject):
                 # 1. Try as Layer ID
                 layer_by_id = QgsProject.instance().mapLayer(value)
                 if layer_by_id:
-                    resolved[key] = layer_by_id
+                    resolved[key] = layer_by_id.id()
                     continue
                 # 2. Try as File Path
                 if (
@@ -163,7 +109,7 @@ class RequestHandler(QObject):
                 # 3. Try as Layer Name
                 layer_by_name = find_layer_by_name(value)
                 if layer_by_name:
-                    resolved[key] = layer_by_name
+                    resolved[key] = layer_by_name.id()
                     continue
 
             resolved[key] = value
@@ -193,6 +139,162 @@ class RequestHandler(QObject):
             }
 
     # --- Actions ---
+
+    def run_algorithm_background(self, command, event, result_container):
+        """
+        Executes a QGIS processing algorithm in a background task (QgsTask).
+        This ensures the UI remains responsive.
+        """
+        params = command.get("params", {})
+        algorithm = params.get("algorithm")
+        alg_params = params.get("parameters", {})
+
+        if not algorithm:
+            result_container["result"] = {
+                "status": "error",
+                "message": "Missing 'algorithm' parameter",
+            }
+            event.set()
+            return
+
+        QgsMessageLog.logMessage(
+            f"Starting background task (QgsTask) for: {algorithm}",
+            LOG_TAG,
+            Qgis.Info,
+        )
+
+        try:
+            from qgis.core import (
+                QgsProcessingAlgRunnerTask,
+                QgsApplication,
+                QgsProcessingContext,
+                QgsProcessingFeedback,
+                QgsProcessingAlgorithm,
+            )
+
+            # Resolve parameters to IDs/Paths (Thread-safe)
+            resolved_params = self.resolve_processing_params(alg_params)
+
+            # Create Context and Feedback on Main Thread
+            context = QgsProcessingContext()
+            context.setProject(QgsProject.instance())
+            feedback = QgsProcessingFeedback()
+
+            # Get Algorithm
+            alg_object = QgsApplication.processingRegistry().algorithmById(algorithm)
+            if not alg_object:
+                result_container["result"] = {
+                    "status": "error",
+                    "message": f"Algorithm not found: {algorithm}",
+                }
+                event.set()
+                return
+
+            if alg_object.flags() & QgsProcessingAlgorithm.FlagNoThreading:
+                QgsMessageLog.logMessage(
+                    f"Algorithm requires main thread (no threading): {algorithm}",
+                    LOG_TAG,
+                    Qgis.Warning,
+                )
+                try:
+                    results = processing.run(
+                        algorithm,
+                        resolved_params,
+                        context=context,
+                        feedback=feedback,
+                    )
+                    result_container["result"] = {
+                        "status": "success",
+                        "result": self._sanitize_processing_results(results),
+                    }
+                except Exception as e:
+                    result_container["result"] = {
+                        "status": "error",
+                        "message": f"Processing failed: {str(e)}",
+                        "traceback": traceback.format_exc(),
+                    }
+                finally:
+                    event.set()
+                return
+
+            # Create Task
+            # QgsProcessingAlgRunnerTask(algorithm, parameters, context, feedback)
+            task = QgsProcessingAlgRunnerTask(
+                alg_object, resolved_params, context, feedback
+            )
+            task.setDescription(f"Smart QGIS: {algorithm}")
+            # Keep references alive while task runs to avoid GC-related crashes
+            self._active_tasks.append(task)
+            self._task_refs[task] = (context, feedback)
+
+            # Handlers for task completion
+            def on_task_finished(status, result_bool):
+                try:
+                    # 'result_bool' is the success status
+                    if result_bool:
+                        # For QgsProcessingAlgRunnerTask, we can sometimes get results from the task
+                        # but mostly we rely on the context or the fact it finished.
+                        # Wait, QgsProcessingAlgRunnerTask.executed signal provides results.
+                        pass
+                    else:
+                        pass
+                except Exception as e:
+                    QgsMessageLog.logMessage(
+                        f"Task finished error: {e}", LOG_TAG, Qgis.Critical
+                    )
+
+            # The 'executed' signal signature: void executed( bool successful, const QVariantMap& results )
+            def on_task_executed(successful, results):
+                try:
+                    if successful:
+                        result_container["result"] = {
+                            "status": "success",
+                            "result": self._sanitize_processing_results(results),
+                        }
+                    else:
+                        result_container["result"] = {
+                            "status": "error",
+                            "message": "Processing task failed (returned False). Check QGIS logs.",
+                        }
+                except Exception as e:
+                    result_container["result"] = {
+                        "status": "error",
+                        "message": f"Error handling task results: {str(e)}",
+                    }
+                finally:
+                    if task in self._task_refs:
+                        del self._task_refs[task]
+                    if task in self._active_tasks:
+                        self._active_tasks.remove(task)
+                    # Wake up socket thread
+                    event.set()
+
+            # Connect executed signal (Primary result carrier)
+            task.executed.connect(on_task_executed)
+
+            # Start Task
+            QgsApplication.taskManager().addTask(task)
+
+        except Exception as e:
+            error_msg = f"Failed to start background task: {str(e)}"
+            QgsMessageLog.logMessage(error_msg, LOG_TAG, Qgis.Critical)
+            QgsMessageLog.logMessage(traceback.format_exc(), LOG_TAG, Qgis.Critical)
+            result_container["result"] = {
+                "status": "error",
+                "message": error_msg,
+                "traceback": traceback.format_exc(),
+            }
+            event.set()
+
+    @staticmethod
+    def _sanitize_processing_results(results):
+        sanitized = {}
+        for k, v in (results or {}).items():
+            if hasattr(v, "id"):
+                sanitized[k] = v.id()
+            else:
+                sanitized[k] = str(v)
+        return sanitized
 
     @staticmethod
     def action_ping(params):
@@ -243,15 +345,36 @@ class RequestHandler(QObject):
         name = params.get("name")
         provider = params.get("provider", "ogr")
 
+        if not path:
+            return {"status": "error", "message": "Missing 'path' parameter"}
+
+        if not os.path.exists(path):
+            return {"status": "error", "message": f"File does not exist: {path}"}
+
+        if not os.access(path, os.R_OK):
+            return {
+                "status": "error",
+                "message": f"File is not readable (permission issue): {path}",
+            }
+
         # If name is not provided, extract filename without extension
         if not name:
             name = os.path.splitext(os.path.basename(path))[0]
+
+        QgsMessageLog.logMessage(
+            f"Attempting to add vector layer: {path} with provider {provider}",
+            LOG_TAG,
+            Qgis.Info,
+        )
 
         layer = self.iface.addVectorLayer(path, name, provider)
         if layer and layer.isValid():
             return {"status": "success", "layer_id": layer.id(), "name": layer.name()}
         else:
-            return {"status": "error", "message": "Failed to load layer"}
+            error_msg = "Failed to load vector layer"
+            if layer:
+                error_msg += f": {layer.error().summary()}"
+            return {"status": "error", "message": error_msg}
 
     def action_add_raster_layer(self, params):
         import os
@@ -260,8 +383,16 @@ class RequestHandler(QObject):
         name = params.get("name")
         provider = params.get("provider", "gdal")
 
+        if not path:
+            return {"status": "error", "message": "Missing 'path' parameter"}
+
+        if not os.path.exists(path):
+            return {"status": "error", "message": f"File does not exist: {path}"}
+
         QgsMessageLog.logMessage(
-            f"Attempting to add raster layer: {path}", LOG_TAG, Qgis.Info
+            f"Attempting to add raster layer: {path} with provider {provider}",
+            LOG_TAG,
+            Qgis.Info,
         )
 
         if not name:
@@ -274,10 +405,12 @@ class RequestHandler(QObject):
             )
             return {"status": "success", "layer_id": layer.id(), "name": layer.name()}
         else:
-            QgsMessageLog.logMessage(
-                f"Failed to add raster layer: {path}", LOG_TAG, Qgis.Warning
-            )
-            return {"status": "error", "message": "Failed to load layer"}
+            error_msg = "Failed to load raster layer"
+            if layer:
+                error_summary = layer.error().summary()
+                if error_summary:
+                    error_msg += f": {error_summary}"
+            return {"status": "error", "message": error_msg}
 
     def action_add_xyz_tile_layer(self, params):
         url = params.get("url")
@@ -325,13 +458,14 @@ class RequestHandler(QObject):
 
     def action_set_point_layer_style(self, params):
         layer_id = params.get("layer_id")
+        layer_name = params.get("layer_name")
         color = params.get("color")
         size = params.get("size")
         shape = params.get("shape")
 
-        layer = self._get_layer_by_id(layer_id)
-        if not layer or not isinstance(layer, QgsVectorLayer):
-            return {"status": "error", "message": "Invalid vector layer"}
+        layer, error = self._resolve_layer(layer_id, layer_name, QgsVectorLayer)
+        if not layer:
+            return {"status": "error", "message": error}
 
         if layer.geometryType() != QgsWkbTypes.PointGeometry:
             return {"status": "error", "message": "Layer is not a point layer"}
@@ -374,13 +508,14 @@ class RequestHandler(QObject):
 
     def action_set_line_layer_style(self, params):
         layer_id = params.get("layer_id")
+        layer_name = params.get("layer_name")
         color = params.get("color")
         width = params.get("width")
         line_style = params.get("line_style")
 
-        layer = self._get_layer_by_id(layer_id)
-        if not layer or not isinstance(layer, QgsVectorLayer):
-            return {"status": "error", "message": "Invalid vector layer"}
+        layer, error = self._resolve_layer(layer_id, layer_name, QgsVectorLayer)
+        if not layer:
+            return {"status": "error", "message": error}
 
         if layer.geometryType() != QgsWkbTypes.LineGeometry:
             return {"status": "error", "message": "Layer is not a line layer"}
@@ -428,14 +563,15 @@ class RequestHandler(QObject):
             )
 
             layer_id = params.get("layer_id")
+            layer_name = params.get("layer_name")
             fill_color = params.get("fill_color")
             fill_style = params.get("fill_style")
             outline_color = params.get("outline_color")
             outline_width = params.get("outline_width")
 
-            layer = self._get_layer_by_id(layer_id)
-            if not layer or not isinstance(layer, QgsVectorLayer):
-                return {"status": "error", "message": "Invalid vector layer"}
+            layer, error = self._resolve_layer(layer_id, layer_name, QgsVectorLayer)
+            if not layer:
+                return {"status": "error", "message": error}
 
             if layer.geometryType() != QgsWkbTypes.PolygonGeometry:
                 return {"status": "error", "message": "Layer is not a polygon layer"}
@@ -507,12 +643,13 @@ class RequestHandler(QObject):
 
     def action_set_categorized_polygon_style(self, params):
         layer_id = params.get("layer_id")
+        layer_name = params.get("layer_name")
         field_name = params.get("field_name")
         color_scheme = params.get("color_scheme", "random")
 
-        layer = self._get_layer_by_id(layer_id)
-        if not layer or not isinstance(layer, QgsVectorLayer):
-            return {"status": "error", "message": "Invalid vector layer"}
+        layer, error = self._resolve_layer(layer_id, layer_name, QgsVectorLayer)
+        if not layer:
+            return {"status": "error", "message": error}
 
         if layer.geometryType() != QgsWkbTypes.PolygonGeometry:
             return {"status": "error", "message": "Layer is not a polygon layer"}
@@ -893,14 +1030,48 @@ class RequestHandler(QObject):
             # Get min/max values if not provided
             data_provider = layer.dataProvider()
             if min_value is None or max_value is None:
-                stats = data_provider.bandStatistics(band, QgsRasterBandStats.All)
-                if min_value is None:
-                    min_value = stats.minimumValue
-                if max_value is None:
-                    max_value = stats.maximumValue
+                try:
+                    # Default: Use cumulative cut (1% - 98%) for better contrast
+                    # This ignores extreme outliers which often skew the full range
+                    lower_cut = 0.01
+                    upper_cut = 0.98
+                    sample_size = 250000  # Reasonable sample size for estimation
+
+                    # QgsRasterDataProvider.cumulativeCut(band, lower, upper, extent, sampleSize)
+                    range_limits = data_provider.cumulativeCut(
+                        band, lower_cut, upper_cut, layer.extent(), sample_size
+                    )
+
+                    if min_value is None:
+                        min_value = range_limits.min()
+                    if max_value is None:
+                        max_value = range_limits.max()
+
+                    QgsMessageLog.logMessage(
+                        f"Calculated 1-98% cumulative cut (sampled): [{min_value}, {max_value}]",
+                        LOG_TAG,
+                        Qgis.Info,
+                    )
+
+                except Exception as e:
+                    QgsMessageLog.logMessage(
+                        f"Cumulative cut failed: {e}. Falling back to full range.",
+                        LOG_TAG,
+                        Qgis.Warning,
+                    )
+                    stats = data_provider.bandStatistics(band, QgsRasterBandStats.All)
+                    if min_value is None:
+                        min_value = stats.minimumValue
+                    if max_value is None:
+                        max_value = stats.maximumValue
 
             min_value = float(min_value)
             max_value = float(max_value)
+
+            # Fix for flat rasters (min == max)
+            if min_value == max_value:
+                min_value -= 1
+                max_value += 1
 
             QgsMessageLog.logMessage(
                 f"Applying colormap '{color_ramp_name}' with range [{min_value}, {max_value}]",
@@ -924,7 +1095,7 @@ class RequestHandler(QObject):
             num_steps = classes if interpolation.lower() == "discrete" else 10
 
             for i in range(num_steps + 1):
-                ratio = i / num_steps
+                ratio = max(0.0, min(1.0, i / num_steps))
                 value = min_value + ratio * (max_value - min_value)
                 color = color_ramp.color(ratio)
                 label = f"{value:.2f}"
@@ -942,6 +1113,10 @@ class RequestHandler(QObject):
             renderer = QgsSingleBandPseudoColorRenderer(
                 data_provider, band, raster_shader
             )
+
+            # Explicitly set classification bounds so Legend knows the exact range
+            renderer.setClassificationMin(min_value)
+            renderer.setClassificationMax(max_value)
 
             # Apply renderer to layer
             layer.setRenderer(renderer)
@@ -1002,44 +1177,50 @@ class RequestHandler(QObject):
             layers.append(layer_info)
         return {"status": "success", "layers": layers}
 
-    @staticmethod
-    def action_remove_layer(params):
+    def action_remove_layer(self, params):
         layer_id = params.get("layer_id")
-        QgsProject.instance().removeMapLayer(layer_id)
+        layer_name = params.get("layer_name")
+        layer, error = self._resolve_layer(layer_id, layer_name)
+        if not layer:
+            return {"status": "error", "message": error}
+
+        QgsProject.instance().removeMapLayer(layer.id())
         return {"status": "success"}
 
-    @staticmethod
-    def action_rename_layer(params):
+    def action_rename_layer(self, params):
         layer_id = params.get("layer_id")
+        layer_name = params.get("layer_name")
         new_name = params.get("new_name")
 
         if not new_name:
             return {"status": "error", "message": "new_name is required"}
 
-        layer = QgsProject.instance().mapLayer(layer_id)
+        layer, error = self._resolve_layer(layer_id, layer_name)
         if not layer:
-            return {"status": "error", "message": "Layer not found"}
+            return {"status": "error", "message": error}
 
         layer.setName(new_name)
-        return {"status": "success", "layer_id": layer_id, "new_name": new_name}
+        return {"status": "success", "layer_id": layer.id(), "new_name": new_name}
 
     def action_zoom_to_layer(self, params):
         layer_id = params.get("layer_id")
-        layer = self._get_layer_by_id(layer_id)
+        layer_name = params.get("layer_name")
+        layer, error = self._resolve_layer(layer_id, layer_name)
         if layer:
             self.iface.mapCanvas().setExtent(layer.extent())
             self.iface.mapCanvas().refresh()
             return {"status": "success"}
-        return {"status": "error", "message": "Layer not found"}
+        return {"status": "error", "message": error}
 
     def action_get_layer_features(self, params):
         layer_id = params.get("layer_id")
+        layer_name = params.get("layer_name")
         limit = params.get("limit", 10)
         filter_expression = params.get("filter_expression")
-        layer = self._get_layer_by_id(layer_id)
+        layer, error = self._resolve_layer(layer_id, layer_name, QgsVectorLayer)
 
-        if not layer or not isinstance(layer, QgsVectorLayer):
-            return {"status": "error", "message": "Invalid vector layer"}
+        if not layer:
+            return {"status": "error", "message": error}
 
         request = QgsFeatureRequest()
         if filter_expression:
@@ -1174,7 +1355,7 @@ class RequestHandler(QObject):
     def action_list_processing_algorithms(params):
         """List all available processing algorithms with optional search filter."""
         search = params.get("search", "").lower()
-        limit = params.get("limit", 50)
+        limit = params.get("limit", 100)
 
         try:
             from qgis.core import QgsApplication
@@ -1296,16 +1477,16 @@ class RequestHandler(QObject):
             QgsProject.instance().write()
         return {"status": "success"}
 
-    @staticmethod
-    def action_save_layer(params):
+    def action_save_layer(self, params):
         layer_id = params.get("layer_id")
+        layer_name = params.get("layer_name")
         output_path = params.get("output_path")
         target_crs_authid = params.get("target_crs")  # Optional, e.g. "EPSG:4610"
         driver_name = params.get("driver_name", "ESRI Shapefile")
 
-        layer = QgsProject.instance().mapLayer(layer_id)
+        layer, error_msg = self._resolve_layer(layer_id, layer_name, QgsVectorLayer)
         if not layer or not layer.isValid():
-            return {"status": "error", "message": "Invalid layer"}
+            return {"status": "error", "message": error_msg or "Invalid layer"}
 
         # Use target CRS if provided, otherwise use layer's CRS
         crs = (
@@ -1501,8 +1682,12 @@ class RequestHandler(QObject):
         from qgis.core import QgsLayoutItemMapGrid, QgsCoordinateReferenceSystem
         from qgis.PyQt.QtGui import QColor
 
-        grid = QgsLayoutItemMapGrid("Grid 1", map_item)
-        map_item.grids().addGrid(grid)
+        grids = map_item.grids()
+        if grids.size() > 0:
+            grid = grids.grid(0)
+        else:
+            grid = QgsLayoutItemMapGrid("Grid 1", map_item)
+            grids.addGrid(grid)
 
         grid.setEnabled(True)
         grid.setIntervalX(float(interval_x))
@@ -1638,27 +1823,39 @@ class RequestHandler(QObject):
         )
         from qgis.PyQt.QtGui import QFont
 
-        scalebar = QgsLayoutItemScaleBar(layout)
+        # Check if scalebar already exists to avoid duplicates
+        existing_scalebars = [
+            item for item in layout.items() if isinstance(item, QgsLayoutItemScaleBar)
+        ]
+        if existing_scalebars:
+            scalebar = existing_scalebars[0]
+        else:
+            scalebar = QgsLayoutItemScaleBar(layout)
+            layout.addLayoutItem(scalebar)
+
         scalebar.setLinkedMap(map_item)
         scalebar.applyDefaultSize()
         scalebar.setStyle(style)
 
         # Explicitly set height and font size for better visibility
-        # Explicitly set height and font size for better visibility
         scalebar.setHeight(6)  # 6mm height
-        scalebar.setFont(QFont("Arial", 12))
         scalebar.setFont(QFont("Arial", 12))
         scalebar.setLabelBarSpace(3)  # Space between bar and text
 
         # Force Metric Units (Kilometers)
         scalebar.setUnits(QgsUnitTypes.DistanceKilometers)
 
-        # Calculate map width in meters using QgsDistanceArea to handle all CRS correctly
+        # Calculate map width in meters using QgsDistanceArea
         extent = map_item.extent()
         crs = map_item.crs()
         da = QgsDistanceArea()
         da.setSourceCrs(crs, QgsProject.instance().transformContext())
-        da.setEllipsoid(QgsProject.instance().ellipsoid())
+
+        # Ensure a valid ellipsoid for WGS84 distance calculation
+        ellipsoid = QgsProject.instance().ellipsoid()
+        if not ellipsoid:
+            ellipsoid = "WGS84"
+        da.setEllipsoid(ellipsoid)
 
         # Measure width at the center latitude
         p1 = QgsPointXY(extent.xMinimum(), extent.center().y())
@@ -1669,14 +1866,13 @@ class RequestHandler(QObject):
         segment_meters = width_meters / 4.0
         segment_km = segment_meters / 1000.0
 
+        # Round to nice interval
         nice_segment_km = self._calculate_nice_interval(segment_km)
         scalebar.setUnitsPerSegment(nice_segment_km)
 
         scalebar.setNumberOfSegments(2)  # 2 segments on the right
         scalebar.setNumberOfSegmentsLeft(0)
         scalebar.update()
-
-        layout.addLayoutItem(scalebar)
 
         # Position
         page_size = layout.pageCollection().page(0).pageSize()
@@ -1705,11 +1901,19 @@ class RequestHandler(QObject):
             QgsLayoutItem,
         )
 
-        legend = QgsLayoutItemLegend(layout)
+        # Check if legend already exists to avoid duplicates
+        existing_legends = [
+            item for item in layout.items() if isinstance(item, QgsLayoutItemLegend)
+        ]
+        if existing_legends:
+            legend = existing_legends[0]
+        else:
+            legend = QgsLayoutItemLegend(layout)
+            layout.addLayoutItem(legend)
+
         if map_item:
             legend.setLinkedMap(map_item)
-
-        layout.addLayoutItem(legend)
+            legend.setLegendFilterByMapEnabled(True)
 
         # Position at bottom-right with margin from frame
         page_size = layout.pageCollection().page(0).pageSize()
@@ -1888,17 +2092,13 @@ class RequestHandler(QObject):
         )
         layout.addLayoutItem(map_item)
 
-        # 4. Set Map Extent to Data Extent
+        map_item.setCrs(target_crs)  # Explicitly set map CRS to WGS84
         buffered_extent = QgsRectangle(full_extent)
         buffered_extent.scale(1.05)
         map_item.zoomToExtent(buffered_extent)
-        map_item.setCrs(target_crs)  # Explicitly set map CRS to WGS84
         map_item.setLayers(visible_layers)
 
         # 5. Add Decorations (Automated)
-
-        # 5. Add Decorations (Automated)
-
         # Grid (Smart Interval Calculation)
         # Calculate X and Y intervals independently to handle long/thin maps
         map_width_units = buffered_extent.width()
@@ -1910,7 +2110,7 @@ class RequestHandler(QObject):
         self._add_grid(layout, map_item, interval_x=interval_x, interval_y=interval_y)
 
         # Title
-        title_text = map_title if map_title else "这是标题"
+        title_text = map_title if map_title else "Title"
         self._add_title(layout, title_text)
 
         # Scale Bar (Smart Placement)
@@ -1922,6 +2122,9 @@ class RequestHandler(QObject):
         # Since we fit the page to data, space is equal.
         # We'll default to Bottom Left.
         self._add_scalebar(layout, map_item, position="BottomLeft")
+
+        # Legend (Smart Placement)
+        self._add_legend(layout, map_item)
 
         # 6. Open Layout Designer
         self.iface.openLayoutDesigner(layout)

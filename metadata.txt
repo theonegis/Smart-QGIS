@@ -1,5 +1,5 @@
 [general]
-name=AI Assistant
+name=Smart QGIS
 qgisMinimumVersion=3.28
 description=AI-based chat interface for Ollama/MCP integration
 version=0.1

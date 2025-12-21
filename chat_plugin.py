@@ -17,7 +17,7 @@ class QGISChatPlugin:
         self.action = None
         self.dock = None
         self.port = 9876
-        self.log_tag = "QGIS AI"
+        self.log_tag = "Smart QGIS"
 
         self.plugin_dir = Path(__file__).parent
         self.socket_server = None
@@ -27,20 +27,22 @@ class QGISChatPlugin:
 
     def initGui(self):
         """called when the plugin is loaded"""
-        QgsMessageLog.logMessage("Loading QGIS AI Plugin...", self.log_tag, Qgis.Info)
+        QgsMessageLog.logMessage(
+            "Loading Smart QGIS Plugin...", self.log_tag, Qgis.Info
+        )
 
         icon = self.plugin_dir / "resources" / "logo.png"
-        self.action = QAction(QIcon(str(icon)), "AI Assistant", self.iface.mainWindow())
+        self.action = QAction(QIcon(str(icon)), "&Smart QGIS", self.iface.mainWindow())
         self.action.triggered.connect(self.open_chat)
-        self.iface.addPluginToMenu("&QGISChat", self.action)
-        self.iface.addToolBarIcon(self.action)
+        plugins_menu = self.iface.pluginMenu()
+        plugins_menu.addAction(self.action)
 
         # Start Servers
         self.start_socket_server()
         self.start_mcp_server()
 
         QgsMessageLog.logMessage(
-            "QGIS AI Plugin loaded successfully", self.log_tag, Qgis.Info
+            "Smart QGIS Plugin loaded successfully", self.log_tag, Qgis.Info
         )
 
     def is_socket_server_running(self):
@@ -129,20 +131,26 @@ class QGISChatPlugin:
 
     def unload(self):
         """called when the plugin is unloaded"""
-        QgsMessageLog.logMessage("Unloading QGIS AI Plugin...", self.log_tag, Qgis.Info)
+        QgsMessageLog.logMessage(
+            "Unloading Smart QGIS Plugin...", self.log_tag, Qgis.Info
+        )
 
         # Stop Socket Server
         self.stop_socket_server()
         self.stop_mcp_server()
 
-        self.iface.removePluginMenu("&QGISChat", self.action)
-        self.iface.removeToolBarIcon(self.action)
+        # Remove from Plugins menu and toolbar
+        if self.action:
+            plugins_menu = self.iface.pluginMenu()
+            if plugins_menu:
+                plugins_menu.removeAction(self.action)
+            self.iface.removeToolBarIcon(self.action)
 
         if self.dock:
             self.iface.removeDockWidget(self.dock)
 
         QgsMessageLog.logMessage(
-            "QGIS AI Plugin unloaded successfully", self.log_tag, Qgis.Info
+            "Smart QGIS Plugin unloaded successfully", self.log_tag, Qgis.Info
         )
 
     def start_mcp_server(self):

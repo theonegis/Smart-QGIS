@@ -6,7 +6,7 @@ import sys
 from concurrent.futures import Future
 from qgis.core import QgsMessageLog, Qgis
 
-LOG_TAG = "QGIS AI"
+LOG_TAG = "Smart QGIS"
 
 class McpClient:
     def __init__(self, process):
