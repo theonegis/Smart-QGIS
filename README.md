@@ -25,6 +25,10 @@ You can also add the MCP server to other MCP client, such as VSCode, Qwen, etc.,
 
 Please implement the tools and its description in the `socket_server.py` and mcp_server.py file (description in English, but you can annotate the code in Chinese).
 
+## What's next?
+
+QGIS agent skills are on the way ...
+
 ## Thanks
 
 This project is strongly inspired by [QGISMCP](https://github.com/jjsantos01/qgis_mcp) project.
