@@ -6,9 +6,9 @@ Smart-QGIS is a local stdio MCP server for Codex, Hermes, and other MCP clients.
 
 ## Migrating from 1.0
 
-Version 1.0 was a QGIS plugin with a Qt chat panel and a Socket bridge. It is archived in both the **`1.0` branch and `1.0` tag**.
+Version 1.0 was a QGIS plugin with a Qt chat panel and a Socket bridge. It is preserved for archival purposes in both the **`1.0` branch and `1.0` tag**; ongoing development takes place on `main`.
 
-Version 2.0 was rebuilt on **`codex/2.0`** as a standalone MCP service. Register it in your agent client instead of copying it into the QGIS plugins directory. Existing `.qgs` and `.qgz` projects can still be opened when their data sources are accessible.
+Version 2.0 is a standalone MCP service on **`main`**, marked by the **`2.0` tag**. Register it in your agent client instead of copying it into the QGIS plugins directory. Existing `.qgs` and `.qgz` projects can still be opened when their data sources are accessible.
 
 ## Features
 
