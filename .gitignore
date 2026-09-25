@@ -214,3 +214,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local reference paper, GIS outputs and client transcripts
+/Smart-QGIS*.pdf
+/artifacts/
+/.firecrawl/
+/.hermes-test/
+/.codex-test/

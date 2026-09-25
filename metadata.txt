@@ -1,7 +1,0 @@
-[general]
-name=Smart QGIS
-qgisMinimumVersion=3.28
-description=AI-based chat interface for Ollama/MCP integration
-version=0.1
-author=Victor Tan
-email=tanzhenyu@nwu.edu.cn
