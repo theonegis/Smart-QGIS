@@ -1,33 +1,37 @@
 # Smart-QGIS 2.0
 
-**让现有 AI Agent 在后台使用 QGIS，无需打开 QGIS 桌面。**
+**Use QGIS from your AI agent, entirely in the background.**
 
-Smart-QGIS 是本地 stdio MCP 服务。Codex、Hermes 等客户端负责对话、规划、模型调用和权限管理；本项目使用 LangChain `StructuredTool` 组织工具，使用独立的 PyQGIS 进程执行空间分析与制图，不内置另一个 Agent harness，也不依赖某家模型服务。
+Smart-QGIS is a local stdio MCP server for Codex, Hermes, and other MCP clients. Your existing agent handles conversation, planning, model calls, and approvals. Smart-QGIS uses LangChain `StructuredTool` definitions and an isolated PyQGIS worker to process geospatial data and produce maps. No QGIS desktop window or separate agent harness is required.
 
-## 从 1.0 迁移
+## Migrating from 1.0
 
-1.0 是 QGIS 插件，使用 Qt 聊天面板和 Socket 转发。原版本保存在 **`1.0` 分支与 `1.0` tag**。2.0 在 `codex/2.0` 分支重新组织代码，移除了插件界面和 Socket 服务。不要把 2.0 复制到 QGIS 插件目录；改为在 Agent 中注册 MCP。原来的 `.qgs/.qgz` 工程仍可打开，前提是数据源可访问。
+Version 1.0 was a QGIS plugin with a Qt chat panel and a Socket bridge. It is archived in both the **`1.0` branch and `1.0` tag**.
 
-## 功能
+Version 2.0 was rebuilt on **`codex/2.0`** as a standalone MCP service. Register it in your agent client instead of copying it into the QGIS plugins directory. Existing `.qgs` and `.qgz` projects can still be opened when their data sources are accessible.
 
-- **工程与数据**：创建、打开、保存工程；加载矢量、栅格、OSM、Google/自定义 XYZ、WMS/WMTS。
-- **图层与可视化**：排序、显隐、重命名；分类/分级符号、标签、透明度、色带、灰度、RGB、山体阴影、QML 样式。
-- **空间处理**：查询并执行本机 QGIS/GDAL 注册的算法，包括裁剪、缓冲区、叠加、重投影、栅格计算、坡度等；可查询算法参数和结果。
-- **要素操作**：筛选、选择、字段统计、GeoJSON 内存图层、导出 GPKG/GeoJSON/SHP。
-- **制图**：可编辑打印布局、标题、图例、比例尺、经纬网、QPT 模板、PNG/JPEG/TIFF/PDF 导出。
+## Features
 
-## 安装与启动
+- **Projects and data:** create, open, and save projects; load vector/raster files, OSM, Google and custom XYZ tiles, WMS, and WMTS.
+- **Layers and visualization:** ordering, visibility, names, categorized/graduated symbols, labels, opacity, color ramps, grayscale, RGB, hillshade, and QML styles.
+- **Geoprocessing:** discover and run installed QGIS/GDAL algorithms, including clipping, buffers, overlays, reprojection, raster calculations, and slope analysis.
+- **Features:** filtering, selection, field statistics, in-memory GeoJSON layers, and GPKG/GeoJSON/SHP export.
+- **Mapping:** editable print layouts, titles, legends, scale bars, graticules, QPT templates, and PNG/JPEG/TIFF/PDF export.
 
-需要 Python 3.11+、[uv](https://docs.astral.sh/uv/) 和含 Python 绑定的 QGIS。macOS 默认发现 `/Applications/QGIS.app`；其他安装位置见[运行环境说明](docs/development.md)。
+## Installation
+
+Install Python 3.11+, [uv](https://docs.astral.sh/uv/), and QGIS with Python bindings. On macOS, `/Applications/QGIS.app` is detected automatically. See the [development guide](docs/development.md) for other runtime locations.
 
 ```bash
 uv sync --locked
 uv run smart-qgis
 ```
 
-最后一条启动 stdio 服务，等待 MCP 客户端输入，**不会出现 GUI 或网页**。不要向标准输入手工键入聊天内容。
+The last command starts a stdio server and waits for MCP input. It does not open a GUI or a web page. Normally, your agent client starts this process for you.
 
-在客户端配置中，将下列路径换成本机项目的绝对路径：
+## Connect your agent
+
+Use absolute paths in your client's configuration:
 
 ```json
 {
@@ -40,16 +44,31 @@ uv run smart-qgis
 }
 ```
 
-Codex 和 Hermes 使用各自的配置格式，见[接入示例](docs/clients.md)。MCP 本身不需要 LLM API Key，模型和登录由客户端配置。建议工具超时设为 900 秒。
+Codex and Hermes use their own configuration formats; see the [client setup guide](docs/clients.md). Model selection and credentials remain in the client. Smart-QGIS itself requires no LLM API key. A client tool timeout of 900 seconds is recommended for larger datasets.
 
-## 使用示例
+## Example
 
-连接后向 Agent 提出：
+After connecting, ask your agent:
 
-> 加载 `/data/ShannXi/ShannXi.shp` 和 `/data/ShannXi/DEM.tif`，用边界裁剪 DEM，NoData 设为 0，保存到 `/output/Elevation.tif`。用 Viridis 色带显示高程，边界透明填充、黑色描边。创建带标题、图例、比例尺和经纬网的地图，导出 PNG、PDF，并保存 QGIS 工程。
+> Load `/data/ShannXi/ShannXi.shp` and `/data/ShannXi/DEM.tif`. Clip the DEM to the boundary with NoData set to 0 and save it as `/output/Elevation.tif`. Apply Viridis to the elevation layer and a transparent fill with a black outline to the boundary. Create a map with a title, legend, scale bar, and graticule. Export PNG and PDF files and save the QGIS project.
 
-服务器还提供 `dem-map` 提示模板和 `qgis://project` 状态资源。
+The server also provides a `dem-map` prompt template and the `qgis://project` resource.
 
-一个 MCP 进程维护一个工程；客户端断开后未保存状态会消失。内存图层应先导出并重新加载，再保存工程。处理算法可覆盖输出文件，请明确指定输出目录。底图需要网络；Google 提供道路、地形、卫星底图预设，也可提供自己的 XYZ URL；使用时遵循提供者的访问及署名要求，不内置凭据。
+Each MCP process owns one project. Save it before disconnecting; export and reload memory layers before saving. Processing algorithms may overwrite their output files, so choose output paths explicitly. Online basemaps require network access. Google roadmap, terrain, and satellite presets support custom URL overrides; follow the provider's access and attribution requirements.
 
-[工具与开发说明](docs/development.md) · [测试与案例](docs/testing.md)
+## Validation and documentation
+
+Validated on macOS with QGIS 4.2.2 through real Codex and Hermes + Ollama sessions, including clipping, styling, map export, and project reopening. Other platforms and QGIS distributions require their own validation.
+
+Technical documentation is written in Chinese:
+
+- [Development and tool reference](docs/development.md)
+- [Client configuration](docs/clients.md)
+- [Tests and reproducible cases](docs/testing.md)
+
+```bash
+uv run ruff check src scripts tests
+uv run pytest -q
+```
+
+Local datasets, generated maps, credentials, and raw client logs are not included in the repository.
