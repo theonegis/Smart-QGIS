@@ -19,7 +19,7 @@ async def run(service, output):
     try:
         layer = await call("add_basemap", service=service)
         await call(
-            "layout",
+            "layout_manage",
             name="Basemap",
             title=f"{service.upper()} · Xi’an",
             layers=[layer["id"]],

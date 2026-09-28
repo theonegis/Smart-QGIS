@@ -7,6 +7,17 @@ import shutil
 from pathlib import Path
 
 
+def _bundled_grass_base() -> Path | None:
+    """Return the newest valid standalone macOS GRASS application base."""
+    candidates = [
+        app / "Contents/Resources"
+        for app in Path("/Applications").glob("GRASS-*.app")
+        if (app / "Contents/Resources/etc/VERSIONNUMBER").is_file()
+        and (app / "Contents/Resources/bin/grass").is_file()
+    ]
+    return max(candidates, key=lambda folder: folder.parent.parent.name, default=None)
+
+
 def worker_environment() -> tuple[str, dict[str, str]]:
     env = os.environ.copy()
     env.pop("PYTHONHOME", None)
@@ -23,7 +34,21 @@ def worker_environment() -> tuple[str, dict[str, str]]:
         env.setdefault("QGIS_PREFIX_PATH", str(app))
         env.setdefault("PROJ_DATA", str(resources / "proj"))
         env.setdefault("GDAL_DATA", str(resources / "gdal"))
-        env["PATH"] = str(contents / "MacOS") + os.pathsep + env.get("PATH", "")
+        # Apps launched from Finder commonly lack Homebrew's shell PATH.  Keep
+        # QGIS's own binaries first, then make an externally installed GRASS
+        # discoverable by the enabled GRASS Processing Provider.
+        path_entries = [str(contents / "MacOS")]
+        path_entries.extend(
+            str(folder)
+            for folder in (Path("/opt/homebrew/bin"), Path("/usr/local/bin"))
+            if folder.is_dir()
+        )
+        path_entries.append(env.get("PATH", ""))
+        env["PATH"] = os.pathsep.join(entry for entry in path_entries if entry)
+        if "GISBASE" not in env:
+            grass_base = _bundled_grass_base()
+            if grass_base:
+                env["GISBASE"] = str(grass_base)
         env["SMART_QGIS_PLUGIN_PATH"] = str(resources / "python/plugins")
     else:
         executable = executable or shutil.which("python3")

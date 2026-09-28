@@ -1,0 +1,13 @@
+"""Shared host guidance; prompts do not authenticate user intent or change locked checks."""
+
+MANAGED_OUTPUT_GUIDANCE = (
+    "In the same step contract, set arguments.parameters.OUTPUT='output:<logical_id>' "
+    "and declare outputs=[{id:'<logical_id>', kind:'raster' or 'vector', binding:'OUTPUT'}]. "
+    "Choose kind from the algorithm output type. The logical ID must match in both places; "
+    "binding is the algorithm's exact output parameter name, not the logical ID. "
+    "Resubmit the corrected step contract before executing; the rejected step was not saved."
+)
+
+MINIMUM_ACCEPTANCE_POLICY = """MANDATORY: Add checks only for explicit user requirements beyond automatic basics. Preflight validates inputs/references/QGIS parameters; postflight validates format/readability/CRS and map title/legend/scale/coordinates. Only explicit user removals go in map_omissions. Never duplicate or infer checks from algorithms/assumptions; do not invent thresholds, geometry, ordering, pixel/grid/value, precision, provenance, coverage or NoData rules. Use documented defaults and assumptions. Preserve locked requirements."""
+
+PARAMETER_HELP_POLICY = """Processing workflow: determine an exact installed algorithm ID, using algorithm_info(action='list') only when discovery is needed, then call prepare_algorithm once. The service reads live QGIS help and treats required, has_default, choices and parent-layer metadata as authoritative. Before creating a step contract it corrects only unambiguous parameter-name case and JSON type/enum representation errors, then runs QGIS native preflight; it never invents semantic values. Put layer bindings in inputs, managed destinations in outputs, and only explicitly known scalar values in parameters. Raster/vector destinations not requested as final deliverables become automatic working assets; declare an intermediate only when a destination type is ambiguous. The service applies documented defaults and returns persisted typed questions for required values that remain unresolved; present those questions to the user and record each actual response with task_answer. Never guess a CRS, field, enum or other required value. Optional parameters and documented defaults do not require questions. After preparation succeeds, copy the returned task_execute_next token unchanged. Postflight checks only basic artifact validity plus explicit user requirements. Do not repeatedly inspect, rediscover or resubmit unchanged state. When the configured correction limit is reached, stop automatic correction, ask the user, and record the actual response with task_record_guidance; persisted structured questions themselves are not correction failures."""

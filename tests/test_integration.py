@@ -18,13 +18,28 @@ async def test_mcp_vector_roundtrip(tmp_path):
     if not Path("/Applications/QGIS.app").exists() and not os.getenv("SMART_QGIS_PYTHON"):
         pytest.skip("Set SMART_QGIS_PYTHON to enable real QGIS tests")
     server = StdioServerParameters(
-        command=sys.executable, args=["-m", "smart_qgis.server"], env=os.environ.copy()
+        command=sys.executable,
+        args=["-m", "smart_qgis.server", "--execution-mode", "legacy"],
+        env=os.environ.copy(),
     )
     async with stdio_client(server) as streams:
         async with ClientSession(*streams, read_timeout_seconds=timedelta(seconds=120)) as session:
             await session.initialize()
             tool_list = await session.list_tools()
-            assert len(tool_list.tools) == 15
+            names = {tool.name for tool in tool_list.tools}
+            assert names == {
+                "project_manage", "load_data", "add_basemap", "layer_manage",
+                "feature_info", "style_vector", "style_raster", "algorithm_info",
+                "processing_execute", "layout_manage", "export_map", "qml_style_manage",
+                "vector_data_manage", "render_raster", "style_vector_graduated",
+            }
+            retired_task_names = {
+                "task_run", "task_continue", "task_repair", "task_resume",
+                "task_clarify", "task_status", "task_diagnose_info",
+                "project", "layers", "features", "algorithms", "run_processing",
+                "layout", "style_file", "vector_data", "style_graduated",
+            }
+            assert retired_task_names.isdisjoint(names)
 
             async def call(tool, **args):
                 response = await session.call_tool(tool, args)
@@ -42,16 +57,16 @@ async def test_mcp_vector_roundtrip(tmp_path):
                     for i in range(1, 6)
                 ],
             }
-            loaded = await call("vector_data", action="create", name="points", geojson=geojson)
+            loaded = await call("vector_data_manage", action="create", name="points", geojson=geojson)
             layer = loaded["id"]
             assert loaded["feature_count"] == 5
-            stats = await call("vector_data", action="statistics", layer=layer, field="value")
+            stats = await call("vector_data_manage", action="statistics", layer=layer, field="value")
             assert stats["mean"] == 3 and stats["sum"] == 15
             assert (
-                await call("vector_data", action="select", layer=layer, expression='"value" > 3')
+                await call("vector_data_manage", action="select", layer=layer, expression='"value" > 3')
             )["selected"] == 2
             await call(
-                "vector_data",
+                "vector_data_manage",
                 action="export",
                 layer=layer,
                 selected_only=True,
@@ -61,7 +76,7 @@ async def test_mcp_vector_roundtrip(tmp_path):
             assert exported["feature_count"] == 2
             for method in ["quantile", "equal_interval", "jenks"]:
                 styled = await call(
-                    "style_graduated", layer=layer, field="value", classes=3, method=method
+                    "style_vector_graduated", layer=layer, field="value", classes=3, method=method
                 )
                 assert styled["classes"] == 3
             await call(
@@ -71,14 +86,14 @@ async def test_mcp_vector_roundtrip(tmp_path):
                 categories=[{"value": "A", "color": "red"}, {"value": "B", "color": "blue"}],
                 label_field="category",
             )
-            await call("style_file", action="save", layer=layer, path=str(tmp_path / "style.qml"))
-            await call("style_file", action="load", layer=layer, path=str(tmp_path / "style.qml"))
-            sample = await call("features", layer=layer, limit=2, expression='"value" > 2')
+            await call("qml_style_manage", action="save", layer=layer, path=str(tmp_path / "style.qml"))
+            await call("qml_style_manage", action="load", layer=layer, path=str(tmp_path / "style.qml"))
+            sample = await call("feature_info", layer=layer, limit=2, expression='"value" > 2')
             assert len(sample["features"]) == 2
-            info = await call("algorithms", action="help", algorithm="native:buffer")
+            info = await call("algorithm_info", action="help", algorithm="native:buffer")
             assert "DISTANCE" in {p["name"] for p in info["parameters"]}
             buffered = await call(
-                "run_processing",
+                "processing_execute",
                 algorithm="native:buffer",
                 parameters={
                     "INPUT": layer,
@@ -90,11 +105,11 @@ async def test_mcp_vector_roundtrip(tmp_path):
             )
             assert buffered["loaded_layers"][0]["feature_count"] == 5
             bad = await session.call_tool(
-                "run_processing", {"algorithm": "native:buffer", "parameters": {"WRONG": 1}}
+                "processing_execute", {"algorithm": "native:buffer", "parameters": {"WRONG": 1}}
             )
             assert bad.isError
             await call(
-                "layout",
+                "layout_manage",
                 name="Test",
                 title="Synthetic map",
                 layers=[exported["id"]],
@@ -103,13 +118,13 @@ async def test_mcp_vector_roundtrip(tmp_path):
             await call("export_map", layout="Test", path=str(tmp_path / "map.pdf"))
             assert (tmp_path / "map.pdf").stat().st_size > 1000
             refused = await session.call_tool(
-                "project", {"action": "save", "path": str(tmp_path / "test.qgz")}
+                "project_manage", {"action": "save", "path": str(tmp_path / "test.qgz")}
             )
             assert refused.isError
             # Memory layers cannot persist; only file-backed layers are asserted on reopen below.
-            await call("layers", action="remove", layer=layer)
-            await call("project", action="save", path=str(tmp_path / "test.qgz"), overwrite=True)
-            info = await call("project", action="open", path=str(tmp_path / "test.qgz"))
+            await call("layer_manage", action="remove", layer=layer)
+            await call("project_manage", action="save", path=str(tmp_path / "test.qgz"), overwrite=True)
+            info = await call("project_manage", action="open", path=str(tmp_path / "test.qgz"))
             assert "Test" in info["layouts"]
             assert len(info["layers"]) == 2
             await call("export_map", layout="Test", path=str(tmp_path / "reopened.png"))
@@ -119,7 +134,7 @@ async def test_mcp_vector_roundtrip(tmp_path):
             assert (
                 await session.get_prompt("dem-map", {"data_dir": "/data", "output_dir": "/output"})
             ).messages
-            results = await asyncio.gather(call("layers"), call("project"))
+            results = await asyncio.gather(call("layer_manage"), call("project_manage"))
             assert len(results[0]["layers"]) == len(results[1]["layers"])
 
 
@@ -157,7 +172,7 @@ ds=None
         styled = await call("style_raster", layer=raster["id"])
         assert styled["minimum"] == 1 and styled["maximum"] == 190
         slope = await call(
-            "run_processing",
+            "processing_execute",
             algorithm="gdal:slope",
             parameters={
                 "INPUT": raster["id"],
@@ -169,7 +184,7 @@ ds=None
         )
         assert slope["loaded_layers"][0]["width"] == 64
         await call(
-            "layout",
+            "layout_manage",
             name="Raster",
             layers=[raster["id"]],
             extent_layer=raster["id"],
@@ -186,7 +201,7 @@ ds=None
             attribution="Synthetic URL; no request intended",
         )
         assert basemap_google["provider"] == "wms"
-        info = await call("layers")
+        info = await call("layer_manage")
         assert info["layers"][-1]["id"] == basemap_google["id"]
         with pytest.raises(Exception, match="Band exceeds"):
             await call("render_raster", layer=raster["id"], band=4)

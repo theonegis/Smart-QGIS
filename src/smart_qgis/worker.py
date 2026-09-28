@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -23,6 +24,7 @@ os.environ["QGIS_CUSTOM_CONFIG_PATH"] = worker_profile.name
 os.environ["QGIS_AUTH_DB_DIR_PATH"] = worker_profile.name
 sys.path.insert(0, os.environ.get("SMART_QGIS_PLUGIN_PATH", "/usr/share/qgis/python/plugins"))
 
+from qgis.analysis import QgsRasterCalcNode  # noqa: E402
 from qgis.core import (  # noqa: E402
     Qgis,
     QgsApplication,
@@ -41,6 +43,7 @@ from qgis.core import (  # noqa: E402
     QgsLayoutPoint,
     QgsLayoutSize,
     QgsMapLayer,
+    QgsMapLayerLegendUtils,
     QgsPalLayerSettings,
     QgsPrintLayout,
     QgsProcessingContext,
@@ -59,8 +62,14 @@ from qgis.core import (  # noqa: E402
     QgsUnitTypes,
     QgsVectorLayer,
     QgsVectorLayerSimpleLabeling,
+    QgsWkbTypes,
 )
 from qgis.PyQt.QtGui import QColor, QFont  # noqa: E402
+
+if __package__:
+    from .raster_display import normalize_alpha, persist_views
+else:
+    from raster_display import normalize_alpha, persist_views
 
 
 def crs(value):
@@ -103,6 +112,46 @@ def plain(value):
     return str(value)
 
 
+class InvalidParameters(ValueError):
+    """QGIS rejected parameters before starting the Processing algorithm."""
+
+
+def parameter_help(parameter):
+    definition = plain(parameter.toVariantMap())
+    optional = bool(parameter.flags() & Qgis.ProcessingParameterFlag.Optional)
+    default = plain(parameter.defaultValue())
+    result = {
+        "name": parameter.name(), "description": parameter.description(),
+        "type": parameter.type(), "destination": parameter.isDestination(),
+        "required": not optional, "has_default": default is not None,
+        "default": default, "definition": definition,
+    }
+    if parameter.type() == "enum":
+        static_strings = bool(definition.get("uses_static_strings"))
+        result["choices"] = [
+            {"value": label if static_strings else index, "label": label}
+            for index, label in enumerate(definition.get("options", []))
+        ]
+        result["multiple"] = bool(definition.get("allow_multiple"))
+        if static_strings:
+            result["value_format"] = (
+                "Array of string choice values" if definition.get("allow_multiple")
+                else "String choice value"
+            )
+        else:
+            result["value_format"] = (
+                "Array of integer choice values, not labels"
+                if definition.get("allow_multiple")
+                else "Integer choice value, not its label"
+            )
+    elif parameter.type() == "extent":
+        result["value_format"] = (
+            "QGIS extent string: xmin,xmax,ymin,ymax [EPSG:code]; "
+            "use comma separators and x bounds before y bounds"
+        )
+    return result
+
+
 class Engine:
     def __init__(self):
         self.profile = worker_profile
@@ -112,6 +161,11 @@ class Engine:
         from processing.core.Processing import Processing
 
         Processing.initialize()
+        # QgsApplication restores its bundled PYTHONHOME during initialization.
+        # External Processing providers such as the standalone macOS GRASS app
+        # launch a different Python and must not inherit QGIS's Python runtime.
+        os.environ.pop("PYTHONHOME", None)
+        os.environ.pop("PYTHONPATH", None)
         self.project = QgsProject.instance()
         self.contexts = []  # Own temporary results for the lifetime of this project.
         self.project.setCrs(crs("EPSG:4326"))
@@ -151,6 +205,7 @@ class Engine:
             result.update(
                 kind="vector",
                 feature_count=layer.featureCount(),
+                geometry_type=QgsWkbTypes.displayString(layer.wkbType()),
                 fields=[{"name": f.name(), "type": f.typeName()} for f in layer.fields()],
             )
         elif isinstance(layer, QgsRasterLayer):
@@ -158,6 +213,52 @@ class Engine:
                 kind="raster", bands=layer.bandCount(), width=layer.width(), height=layer.height()
             )
         return result
+
+    @staticmethod
+    def raster_summary(layer):
+        """Return compact output-health facts without turning them into acceptance rules."""
+        from osgeo import gdal
+
+        dataset = gdal.Open(layer.source().split("|", 1)[0], gdal.GA_ReadOnly)
+        if dataset is None:
+            return None
+        bands = []
+        for index in range(1, dataset.RasterCount + 1):
+            band = dataset.GetRasterBand(index)
+            statistics_error = None
+            gdal.PushErrorHandler("CPLQuietErrorHandler")
+            try:
+                try:
+                    statistics = band.GetStatistics(True, True)
+                except RuntimeError as exc:
+                    statistics = None
+                    statistics_error = str(exc)
+            finally:
+                gdal.PopErrorHandler()
+            valid_text = band.GetMetadataItem("STATISTICS_VALID_PERCENT")
+            try:
+                valid_percent = float(valid_text) if valid_text is not None else None
+            except ValueError:
+                valid_percent = None
+            all_nodata = valid_percent == 0 or (
+                statistics is None
+                and statistics_error is not None
+                and "no valid pixels" in statistics_error.casefold()
+            )
+            if all_nodata:
+                valid_percent = 0.0
+            bands.append({
+                "band": index,
+                "nodata": plain(band.GetNoDataValue()),
+                "valid_percent": valid_percent,
+                "minimum": None if all_nodata or not statistics else plain(statistics[0]),
+                "maximum": None if all_nodata or not statistics else plain(statistics[1]),
+            })
+        return {
+            "bands": bands,
+            "all_nodata": bool(bands) and all(item["valid_percent"] == 0 for item in bands),
+            "statistics_approximate": True,
+        }
 
     def ordered_layers(self):
         return list(self.project.layerTreeRoot().layerOrder())
@@ -221,6 +322,7 @@ class Engine:
                 [".qgs", ".qgz"],
                 a.get("overwrite", False),
             )
+            persist_views(self.project, Path(path).with_suffix(".sources"))
             if not self.project.write(path):
                 raise ValueError("Failed to save project")
         return self.info()
@@ -385,9 +487,7 @@ class Engine:
         band = a.get("band", 1)
         if band > layer.bandCount():
             raise ValueError("Band exceeds raster band count")
-        ramp = QgsStyle.defaultStyle().colorRamp(a.get("ramp", "Viridis"))
-        if ramp is None:
-            raise ValueError("Unknown color ramp; call algorithms(action='ramps')")
+        mode = a.get("mode", "continuous")
         minimum, maximum = a.get("minimum"), a.get("maximum")
         if minimum is None or maximum is None:
             stats = layer.dataProvider().bandStatistics(band)
@@ -398,23 +498,60 @@ class Engine:
         if minimum == maximum:
             maximum = minimum + 1
         shader = QgsColorRampShader(minimum, maximum)
-        shader.setColorRampType(QgsColorRampShader.Interpolated)
-        classes = a.get("classes", 8)
-        items = []
-        for i in range(classes):
-            ratio = i / (classes - 1)
-            value = minimum + ratio * (maximum - minimum)
-            items.append(QgsColorRampShader.ColorRampItem(value, ramp.color(ratio), f"{value:.0f}"))
-        shader.setColorRampItemList(items)
+        if mode == "mask":
+            shader.setColorRampType(QgsColorRampShader.Discrete)
+            shader.setColorRampItemList([
+                QgsColorRampShader.ColorRampItem(
+                    maximum, color(a.get("color", "#666666")),
+                    a.get("label") or layer.name(),
+                )
+            ])
+        else:
+            requested_ramp = a.get("ramp", "Viridis")
+            available_ramps = QgsStyle.defaultStyle().colorRampNames()
+            canonical_ramp = next(
+                (name for name in available_ramps if name.casefold() == str(requested_ramp).casefold()),
+                requested_ramp,
+            )
+            ramp = QgsStyle.defaultStyle().colorRamp(canonical_ramp)
+            if ramp is None:
+                raise ValueError("Unknown color ramp; call algorithms(action='ramps')")
+            shader.setColorRampType(QgsColorRampShader.Interpolated)
+            classes = a.get("classes", 8)
+            items = []
+            for i in range(classes):
+                ratio = i / (classes - 1)
+                value = minimum + ratio * (maximum - minimum)
+                # QGIS stores shader-item colors as 8-bit RGB(A) in QGZ.
+                stable_color = QColor(*ramp.color(ratio).getRgb())
+                items.append(QgsColorRampShader.ColorRampItem(value, stable_color, f"{value:.0f}"))
+            shader.setColorRampItemList(items)
+            legend_settings = shader.legendSettings()
+            legend_settings.setMinimumLabel(f"{minimum:.3g}")
+            legend_settings.setMaximumLabel(f"{maximum:.3g}")
+            shader.setLegendSettings(legend_settings)
         raster_shader = QgsRasterShader(minimum, maximum)
         raster_shader.setRasterShaderFunction(shader)
+        # Replacing the renderer otherwise drops the source Alpha mask and paints
+        # clipped-out pixels as valid elevations. Preserve an explicit selection;
+        # discover provider Alpha too, so restyling repairs older saved renderers.
+        previous = layer.renderer()
+        alpha_band = previous.alphaBand() if previous else -1
+        if not 1 <= alpha_band <= layer.bandCount():
+            alpha_band = next((index for index in range(1, layer.bandCount() + 1)
+                               if layer.dataProvider().colorInterpretation(index)
+                               == Qgis.RasterColorInterpretation.AlphaBand), -1)
+        if alpha_band > 0:
+            normalize_alpha(layer, alpha_band, worker_profile.name)
         renderer = QgsSingleBandPseudoColorRenderer(layer.dataProvider(), band, raster_shader)
+        renderer.setAlphaBand(alpha_band)
         renderer.setClassificationMin(minimum)
         renderer.setClassificationMax(maximum)
         layer.setRenderer(renderer)
         layer.setOpacity(a.get("opacity", 1))
         return {
             "layer": layer.id(),
+            "mode": mode,
             "ramp": a.get("ramp", "Viridis"),
             "minimum": minimum,
             "maximum": maximum,
@@ -433,27 +570,22 @@ class Engine:
                 "id": algorithm.id(),
                 "name": algorithm.displayName(),
                 "help": algorithm.shortHelpString(),
-                "parameters": [
-                    {
-                        "name": p.name(),
-                        "description": p.description(),
-                        "type": p.type(),
-                        "default": plain(p.defaultValue()),
-                        "definition": plain(p.toVariantMap()),
-                    }
-                    for p in algorithm.parameterDefinitions()
-                ],
+                "parameters": [parameter_help(p) for p in algorithm.parameterDefinitions()],
                 "outputs": [
                     {"name": p.name(), "description": p.description(), "type": p.type()}
                     for p in algorithm.outputDefinitions()
                 ],
             }
-        query = a.get("query", "").casefold()
+        terms = a.get("query", "").casefold().split()
         matches = sorted(
             [
-                {"id": alg.id(), "name": alg.displayName(), "provider": alg.provider().id()}
+                {"id": alg.id(), "name": alg.displayName(), "provider": alg.provider().id(),
+                 "group": alg.groupId(), "group_name": alg.group()}
                 for alg in registry.algorithms()
-                if query in (alg.id() + " " + alg.displayName()).casefold()
+                if all(term in (alg.id() + " " + alg.displayName() + " " + alg.group()).casefold()
+                       for term in terms)
+                and (not a.get("provider") or alg.provider().id() == a["provider"])
+                and (not a.get("group") or alg.groupId() == a["group"])
             ],
             key=lambda x: x["id"],
         )
@@ -462,9 +594,10 @@ class Engine:
             "total": len(matches),
             "algorithms": matches[offset : offset + limit],
             "offset": offset,
+            "next_offset": offset + limit if offset + limit < len(matches) else None,
         }
 
-    def run_processing(self, a):
+    def prepare_processing(self, a):
         alg = QgsApplication.processingRegistry().algorithmById(a["algorithm"])
         if not alg:
             raise ValueError("Unknown algorithm; discover available IDs first")
@@ -472,7 +605,7 @@ class Engine:
         known = {p.name() for p in alg.parameterDefinitions()}
         unknown = set(params) - known
         if unknown:
-            raise ValueError(f"Unknown algorithm parameters: {sorted(unknown)}")
+            raise InvalidParameters(f"Unknown algorithm parameters: {sorted(unknown)}")
         # Only resolve IDs in input layer parameters: never reinterpret output names/expressions.
         for definition in alg.parameterDefinitions():
             key = definition.name()
@@ -490,14 +623,32 @@ class Engine:
                 )
         context = QgsProcessingContext()
         context.setProject(self.project)
-        feedback = QgsProcessingFeedback()
+        if alg.id() in {"native:rastercalc", "qgis:rastercalculator"}:
+            expression = params.get("EXPRESSION")
+            if isinstance(expression, str) and QgsRasterCalcNode.parseRasterCalcString(
+                expression, ""
+            ) is None:
+                raise InvalidParameters(
+                    "Invalid QGIS raster calculator EXPRESSION syntax; use its documented "
+                    "double-quoted layer@band references and supported operators"
+                )
         valid, message = alg.checkParameterValues(params, context)
         if not valid:
-            raise ValueError(message)
+            raise InvalidParameters(message)
+        return alg, params, context
+
+    def processing_preflight(self, a):
+        self.prepare_processing(a)
+        return {"valid": True, "executed": False}
+
+    def run_processing(self, a):
+        alg, params, context = self.prepare_processing(a)
+        feedback = QgsProcessingFeedback()
         import processing
 
         result = processing.run(alg, params, context=context, feedback=feedback)
         loaded = []
+        warnings = []
         if a.get("load_outputs", True):
             for _key, value in result.items():
                 values = value if isinstance(value, list) else [value]
@@ -512,12 +663,25 @@ class Engine:
                             layer = candidate if candidate.isValid() else None
                     if layer is not None and layer.isValid():
                         self.project.addMapLayer(layer)
-                        loaded.append(self.layer_info(layer))
+                        info = self.layer_info(layer)
+                        if isinstance(layer, QgsRasterLayer):
+                            summary = self.raster_summary(layer)
+                            if summary is not None:
+                                info["raster_summary"] = summary
+                                if summary["all_nodata"]:
+                                    warnings.append({
+                                        "code": "RASTER_ALL_NODATA",
+                                        "message": "A raster output contains no valid pixels",
+                                        "layer_id": layer.id(),
+                                        "source": layer.source(),
+                                    })
+                        loaded.append(info)
         self.contexts.append(context)
         return {
             "algorithm": alg.id(),
             "outputs": plain(result),
             "loaded_layers": loaded,
+            "warnings": warnings,
             "log": feedback.textLog()[-12000:],
         }
 
@@ -527,6 +691,44 @@ class Engine:
         return QgsCoordinateTransform(layer.crs(), target, self.project).transformBoundingBox(
             layer.extent()
         )
+
+    def visible_extent(self, layer, target):
+        """Use the footprint of valid raster cells when it is cheap to inspect."""
+        if not isinstance(layer, QgsRasterLayer) or layer.providerType() != "gdal":
+            return self.transformed_extent(layer, target)
+        import numpy as np
+        from osgeo import gdal
+
+        dataset = gdal.Open(layer.source().split("|", 1)[0], gdal.GA_ReadOnly)
+        if (dataset is None or dataset.RasterCount < 1
+                or dataset.RasterXSize * dataset.RasterYSize > 25_000_000):
+            return self.transformed_extent(layer, target)
+        band = dataset.GetRasterBand(1)
+        values = band.ReadAsArray()
+        valid = np.isfinite(values)
+        nodata = band.GetNoDataValue()
+        if nodata is not None:
+            valid &= values != nodata
+        rows = np.flatnonzero(valid.any(axis=1))
+        columns = np.flatnonzero(valid.any(axis=0))
+        if not len(rows) or not len(columns):
+            return self.transformed_extent(layer, target)
+        transform = dataset.GetGeoTransform()
+        corners = [
+            (x, y)
+            for x in (int(columns[0]), int(columns[-1]) + 1)
+            for y in (int(rows[0]), int(rows[-1]) + 1)
+        ]
+        points = [
+            (transform[0] + x * transform[1] + y * transform[2],
+             transform[3] + x * transform[4] + y * transform[5])
+            for x, y in corners
+        ]
+        extent = QgsRectangle(
+            min(x for x, _ in points), min(y for _, y in points),
+            max(x for x, _ in points), max(y for _, y in points),
+        )
+        return QgsCoordinateTransform(layer.crs(), target, self.project).transformBoundingBox(extent)
 
     def layout(self, a):
         manager = self.project.layoutManager()
@@ -558,13 +760,21 @@ class Engine:
         )
         if not layers:
             raise ValueError("A map needs at least one layer")
-        target = crs(a["crs"]) if a.get("crs") else self.project.crs()
+        for layer in layers:
+            stem = Path(layer.source().split("|", 1)[0]).stem
+            generated_name = re.fullmatch(
+                re.escape(stem) + r"_[0-9a-f]{8}(?:_[0-9a-f]{4}){3}_[0-9a-f]{12}",
+                layer.name(), re.IGNORECASE,
+            )
+            if layer.name() == stem or generated_name:
+                layer.setName(stem.replace("_", " ").capitalize())
+        target = crs(a["crs"]) if a.get("crs") else layers[0].crs()
         if a.get("extent"):
             extent = QgsRectangle(*a["extent"])
             if a["extent"][0] >= a["extent"][2] or a["extent"][1] >= a["extent"][3]:
                 raise ValueError("Extent bounds must be ordered")
         elif a.get("extent_layer"):
-            extent = self.transformed_extent(self.resolve(a["extent_layer"]), target)
+            extent = self.visible_extent(self.resolve(a["extent_layer"]), target)
         else:
             content = [layer_item for layer_item in layers if layer_item.providerType() != "wms"]
             if not content:
@@ -572,7 +782,7 @@ class Engine:
             extent = QgsRectangle()
             extent.setMinimal()
             for layer in content:
-                extent.combineExtentWith(self.transformed_extent(layer, target))
+                extent.combineExtentWith(self.visible_extent(layer, target))
         if extent.isEmpty() or not extent.isFinite():
             raise ValueError("Map extent must be finite and nonempty")
         extent.scale(1.08)
@@ -580,13 +790,25 @@ class Engine:
         layout.initializeDefaults()
         layout.setName(name)
         width, height = a.get("width_mm", 210), a.get("height_mm", 297)
+        outside = a.get("map_element_placement") == "outside"
+        outside_bottom = outside and extent.height() > extent.width() * 1.3
+        if outside_bottom and "width_mm" not in a:
+            width = min(width, max(135, 24 + (height - 110) * extent.width() / extent.height()))
         layout.pageCollection().pages()[0].setPageSize(QgsLayoutSize(width, height))
         layout.renderContext().setDpi(150)
+        frame_width = width - (76 if outside and not outside_bottom else 24)
+        frame_height = height - (110 if outside_bottom else 60)
+        if extent.width() / extent.height() >= frame_width / frame_height:
+            map_width, map_height = frame_width, frame_width * extent.height() / extent.width()
+        else:
+            map_width, map_height = frame_height * extent.width() / extent.height(), frame_height
+        map_x = 12 + (frame_width - map_width) / 2
+        map_y = 28 + (frame_height - map_height) / 2
         map_item = QgsLayoutItemMap(layout)
         map_item.setId("main-map")
         layout.addLayoutItem(map_item)
-        map_item.attemptMove(QgsLayoutPoint(12, 28))
-        map_item.attemptResize(QgsLayoutSize(width - 24, height - 60))
+        map_item.attemptMove(QgsLayoutPoint(map_x, map_y))
+        map_item.attemptResize(QgsLayoutSize(map_width, map_height))
         map_item.setCrs(target)
         map_item.setLayers(layers)
         map_item.setKeepLayerSet(True)
@@ -605,16 +827,20 @@ class Engine:
             item.attemptResize(QgsLayoutSize(w, h))
             return item
 
-        label(a.get("title") or name, 12, 8, width - 24, 15, 18)
+        if a.get("show_title", True):
+            title_item = label(a.get("title") or name, 12, 8, width - 24, 15,
+                               min(18, max(11, round(width / 12))))
+            title_item.setId("map-title")
         if a.get("grid", True):
-            grid = QgsLayoutItemMapGrid("WGS84 graticule", map_item)
+            grid_reference = crs(a.get("grid_crs") or "EPSG:4326")
+            grid = QgsLayoutItemMapGrid("Coordinate annotations", map_item)
             map_item.grids().addGrid(grid)
             grid.setEnabled(True)
-            grid.setCrs(crs("EPSG:4326"))
-            geo_extent = QgsCoordinateTransform(
-                target, crs("EPSG:4326"), self.project
+            grid.setCrs(grid_reference)
+            grid_extent = QgsCoordinateTransform(
+                target, grid_reference, self.project
             ).transformBoundingBox(map_item.extent())
-            span = max(geo_extent.width(), geo_extent.height()) / 5
+            span = max(grid_extent.width(), grid_extent.height()) / 5
             power = 10 ** math.floor(math.log10(span))
             interval = next((n * power for n in (1, 2, 5, 10) if n * power >= span), 10 * power)
             grid.setIntervalX(interval)
@@ -628,13 +854,17 @@ class Engine:
             grid_format.setFont(QFont("Arial", 8))
             grid_format.setSize(8)
             grid.setAnnotationTextFormat(grid_format)
-            for side in (QgsLayoutItemMapGrid.Top, QgsLayoutItemMapGrid.Bottom):
-                grid.setAnnotationDisplay(QgsLayoutItemMapGrid.LongitudeOnly, side)
-            for side in (QgsLayoutItemMapGrid.Left, QgsLayoutItemMapGrid.Right):
-                grid.setAnnotationDisplay(QgsLayoutItemMapGrid.LatitudeOnly, side)
+            if grid_reference.isGeographic():
+                for side in (QgsLayoutItemMapGrid.Top, QgsLayoutItemMapGrid.Bottom):
+                    grid.setAnnotationDisplay(QgsLayoutItemMapGrid.LongitudeOnly, side)
+                for side in (QgsLayoutItemMapGrid.Left, QgsLayoutItemMapGrid.Right):
+                    grid.setAnnotationDisplay(QgsLayoutItemMapGrid.LatitudeOnly, side)
+            if a.get("legend", True):
+                grid.setAnnotationDisplay(QgsLayoutItemMapGrid.HideAll, QgsLayoutItemMapGrid.Right)
         if a.get("legend", True):
             legend = QgsLayoutItemLegend(layout)
-            legend.setTitle("Legend")
+            map_title = a.get("title") or name
+            legend.setTitle("图例" if re.search(r"[\u4e00-\u9fff]", map_title) else "Legend")
             legend.setLinkedMap(map_item)
             if hasattr(Qgis, "LegendSyncMode"):
                 legend.setSyncMode(Qgis.LegendSyncMode.Manual)
@@ -644,27 +874,56 @@ class Engine:
             root.clear()
             for layer in layers:
                 if layer.providerType() != "wms":
-                    root.addLayer(layer)
+                    node = root.addLayer(layer)
+                    legend_nodes = legend.model().layerLegendNodes(node)
+                    if (len(legend_nodes) == 2
+                            and re.fullmatch(r"Band \d+(?: \([^)]*\))?", str(legend_nodes[0].data(0)))):
+                        QgsMapLayerLegendUtils.setLegendNodeUserLabel(node, 0, " ")
+                        legend.model().refreshLayerLegend(node)
             layout.addLayoutItem(legend)
-            legend.attemptMove(QgsLayoutPoint(16, 34))
+            legend.adjustBoxSize()
+            # QGIS may expand the legend only at render time. Reserve a stable
+            # upper-right inset instead of positioning from its premature size.
+            legend.attemptMove(QgsLayoutPoint(
+                12 if outside_bottom else (width - 60 if outside else max(map_x + 4, map_x + map_width - 70)),
+                map_y + map_height + 8 if outside_bottom else (34 if outside else map_y + 4),
+            ))
             legend.setBackgroundEnabled(True)
-            legend.setBackgroundColor(QColor(255, 255, 255, 220))
+            legend.setBackgroundColor(QColor(255, 255, 255, 230))
         if a.get("scalebar", True):
             scale = QgsLayoutItemScaleBar(layout)
             scale.setStyle("Single Box")
             scale.setLinkedMap(map_item)
             scale.applyDefaultSize()
             scale.setUnits(QgsUnitTypes.DistanceKilometers)
-            scale.setUnitsPerSegment(
-                max(1, round(map_item.extent().width() / 10000))
-                if not target.isGeographic()
-                else 50
-            )
+            map_extent = map_item.extent()
+            if target.isGeographic():
+                width_km = (map_extent.width() * 111.32
+                            * max(0.01, math.cos(math.radians(map_extent.center().y()))))
+            else:
+                width_km = (map_extent.width() * QgsUnitTypes.fromUnitToUnitFactor(
+                    target.mapUnits(), QgsUnitTypes.DistanceKilometers
+                ))
+            scale.setUnitsPerSegment(float(f"{max(width_km / 10, 0.000001):.2g}"))
             scale.setUnitLabel("km")
             scale.setNumberOfSegments(2)
             scale.setNumberOfSegmentsLeft(0)
             layout.addLayoutItem(scale)
-            scale.attemptMove(QgsLayoutPoint(12, height - 22))
+            scale.refresh()
+            scale.attemptMove(QgsLayoutPoint(
+                width - 50 if outside_bottom else (width - 60 if outside else map_x + 4),
+                map_y + map_height + 12 if outside_bottom else (height - 52 if outside else map_y + map_height - 20),
+            ))
+        if outside_bottom and "height_mm" not in a and len(layers) == 1:
+            footer_bottom = map_y + map_height
+            if a.get("legend", True):
+                footer_bottom = max(footer_bottom,
+                                    legend.positionWithUnits().y() + legend.sizeWithUnits().height())
+            if a.get("scalebar", True):
+                footer_bottom = max(footer_bottom,
+                                    scale.positionWithUnits().y() + scale.sizeWithUnits().height())
+            height = min(height, max(footer_bottom + 12, map_y + map_height + 24))
+            layout.pageCollection().pages()[0].setPageSize(QgsLayoutSize(width, height))
         attribution = " · ".join(
             dict.fromkeys(
                 layer_item.serverProperties().attribution()
@@ -683,6 +942,8 @@ class Engine:
             "layers": [layer_item.id() for layer_item in layers],
             "width_mm": width,
             "height_mm": height,
+            "map_element_placement": "outside" if outside else "inside",
+            "map_element_area": "bottom" if outside_bottom else ("right" if outside else "inside"),
         }
 
     def export_map(self, a):
@@ -727,6 +988,11 @@ class Engine:
     def dispatch(self, operation, arguments):
         import extra_ops
 
+        if operation.startswith("_"):
+            import reliable_ops
+
+            return reliable_ops.dispatch(self, operation, arguments)
+
         extra = {
             "style_file": lambda a: extra_ops.style_file(self, a, destination),
             "vector_data": lambda a: extra_ops.vector_data(self, a, destination, crs),
@@ -763,7 +1029,10 @@ def main():
                 result = engine.dispatch(request["operation"], request["arguments"])
                 response = {"id": request["id"], "result": plain(result)}
             except Exception as exc:
-                response = {"id": request.get("id"), "error": f"{type(exc).__name__}: {exc}"}
+                response = {
+                    "id": request.get("id"), "error": f"{type(exc).__name__}: {exc}",
+                    "error_code": "INVALID_PARAMETERS" if isinstance(exc, InvalidParameters) else "OPERATION_FAILED",
+                }
             protocol.write(json.dumps(response, ensure_ascii=False, allow_nan=False) + "\n")
     finally:
         engine.close()

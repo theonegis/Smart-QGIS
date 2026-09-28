@@ -19,10 +19,10 @@ async def run(elevation, output):
         return result
 
     try:
-        await call("project", action="create", crs="EPSG:32649", title="Shaanxi terrain")
-        await call("algorithms", action="help", algorithm="gdal:warpreproject")
+        await call("project_manage", action="create", crs="EPSG:32649", title="Shaanxi terrain")
+        await call("algorithm_info", action="help", algorithm="gdal:warpreproject")
         projected = await call(
-            "run_processing",
+            "processing_execute",
             algorithm="gdal:warpreproject",
             parameters={
                 "INPUT": str(elevation),
@@ -35,9 +35,9 @@ async def run(elevation, output):
         )
         dem = projected["loaded_layers"][0]["id"]
         await call("render_raster", layer=dem, mode="hillshade")
-        await call("algorithms", action="help", algorithm="gdal:slope")
+        await call("algorithm_info", action="help", algorithm="gdal:slope")
         slope = await call(
-            "run_processing",
+            "processing_execute",
             algorithm="gdal:slope",
             parameters={
                 "INPUT": dem,
@@ -50,7 +50,7 @@ async def run(elevation, output):
         slope_id = slope["loaded_layers"][0]["id"]
         await call("style_raster", layer=slope_id, ramp="Viridis", opacity=0.8)
         await call(
-            "layout",
+            "layout_manage",
             name="Slope",
             title="陕西省坡度分布图",
             layers=[slope_id, dem],
@@ -58,7 +58,7 @@ async def run(elevation, output):
         )
         await call("export_map", layout="Slope", path=str(output / "slope.png"))
         await call("export_map", layout="Slope", path=str(output / "slope.pdf"))
-        await call("project", action="save", path=str(output / "terrain.qgz"))
+        await call("project_manage", action="save", path=str(output / "terrain.qgz"))
     finally:
         await bridge.close()
 

@@ -72,7 +72,10 @@ class VectorStyle(Arguments):
 
 class RasterStyle(Arguments):
     layer: str
+    mode: Literal["continuous", "mask"] = "continuous"
     ramp: str = "Viridis"
+    color: str = "#666666"
+    label: str | None = None
     band: int = Field(1, ge=1)
     minimum: float | None = None
     maximum: float | None = None
@@ -81,15 +84,37 @@ class RasterStyle(Arguments):
 
 
 class Algorithms(Arguments):
-    action: Literal["list", "help", "ramps"] = "list"
-    query: str = ""
-    algorithm: str | None = None
-    offset: int = Field(0, ge=0)
-    limit: int = Field(30, ge=1, le=200)
+    action: Literal["list", "help", "ramps"] = Field(
+        "list",
+        description="list searches installed algorithms; help returns one exact algorithm schema; ramps lists color ramps",
+    )
+    query: str = Field(
+        "",
+        description="For action=list only: one or two space-separated keywords; every word must match",
+    )
+    algorithm: str | None = Field(
+        None,
+        description="Required for action=help: exact installed provider:algorithm ID copied from list results",
+    )
+    provider: str | None = Field(None, description="Exact provider ID filter for list, e.g. native or gdal")
+    group: str | None = Field(None, description="Exact group ID filter for list; returned in list entries")
+    offset: int = Field(0, ge=0, description="For action=list only: zero-based result offset")
+    limit: int = Field(30, ge=1, le=200, description="For action=list only: maximum results; keep small")
+    include_details: bool = Field(
+        False,
+        description=(
+            "Use only when compact help lacks a specific parameter detail; includes raw "
+            "provider definitions and long algorithm help"
+        ),
+    )
+
+
+class LayerList(Arguments):
+    """Reliable-mode read-only project layer listing."""
 
 
 class Processing(Arguments):
-    algorithm: str = Field(description="Exact QGIS processing ID; discover with algorithms first")
+    algorithm: str = Field(description="Exact QGIS processing ID; discover with algorithm_info first")
     parameters: dict[str, Any] = Field(
         description="QGIS algorithm parameters. Use layer IDs or absolute file paths. Use durable output paths to persist results."
     )
@@ -100,6 +125,7 @@ class Layout(Arguments):
     action: Literal["create", "list", "remove", "template"] = "create"
     name: str = "Map"
     title: str = ""
+    show_title: bool = True
     layers: list[str] | None = Field(None, description="Topmost first. Defaults to visible layers.")
     extent_layer: str | None = Field(
         None, description="Use this layer's transformed extent; excludes global basemap extents"
@@ -113,6 +139,15 @@ class Layout(Arguments):
     legend: bool = True
     scalebar: bool = True
     grid: bool = True
+    map_element_placement: Literal["auto", "inside", "outside"] = Field(
+        "auto", description="Place legend and scale bar inside available map-frame space or outside when they do not fit"
+    )
+    grid_crs: str | None = Field(
+        None,
+        description=(
+            "Coordinate annotation CRS; defaults to EPSG:4326. May be geographic or projected."
+        ),
+    )
     path: str | None = Field(None, description="QPT template output path for action=template")
     overwrite: bool = False
 
@@ -126,14 +161,14 @@ class Export(Arguments):
 
 SPECS = [
     (
-        "project",
+        "project_manage",
         Project,
         "Create, open, save or inspect a headless QGIS project (.qgz/.qgs). Create/open replace in-memory state; save first. No QGIS window is needed.",
     ),
     (
         "load_data",
         Load,
-        "Load vector (SHP, GeoJSON, GPKG etc.) or raster (GeoTIFF etc.) data. Returns ID, CRS, extent and fields/bands.",
+        "Mutation that loads vector/raster data into the QGIS project. In reliable mode approve a step with exactly one output using binding='layer'; use inspect_data for read-only inspection.",
     ),
     (
         "add_basemap",
@@ -141,12 +176,12 @@ SPECS = [
         "Add OSM, authorized Google XYZ tiles, custom XYZ, WMS or WMTS. Remote imagery requires network access. Google supports roadmap, terrain and satellite presets or a custom URL.",
     ),
     (
-        "layers",
+        "layer_manage",
         Layers,
         "List, rename, remove, reorder or show/hide layers. Order is topmost first; names must be unique, IDs are preferred.",
     ),
     (
-        "features",
+        "feature_info",
         Features,
         "Inspect a bounded GeoJSON feature sample and attributes, optionally filtered by a QGIS expression.",
     ),
@@ -161,17 +196,17 @@ SPECS = [
         "Apply a QGIS color ramp to a raster band using valid-pixel statistics. NoData stays transparent. Default ramp is Viridis.",
     ),
     (
-        "algorithms",
+        "algorithm_info",
         Algorithms,
-        "Search installed QGIS algorithms, inspect parameters/outputs/help, or list color ramps. Always inspect algorithm help before processing.",
+        "Read-only Processing registry lookup after task_start (or task_recover). Use list once with 1-2 keywords, then help once for the chosen exact provider:algorithm ID. Stop searching after help identifies a suitable algorithm; prepare_algorithm performs the live preflight.",
     ),
     (
-        "run_processing",
+        "processing_execute",
         Processing,
         "Execute an installed QGIS/GDAL processing algorithm. Read help first. Output files may be overwritten by the algorithm: choose fresh paths. TEMPORARY_OUTPUT lives only for this server session.",
     ),
     (
-        "layout",
+        "layout_manage",
         Layout,
         "Create/manage a printable map document with title, legend, scale bar and WGS84 graticule, or save it as QPT. Saved projects retain layouts. extent_layer avoids global basemap extents.",
     ),
@@ -182,10 +217,32 @@ SPECS = [
     ),
 ]
 
+WORKER_OPERATIONS = {
+    "project_manage": "project", "layer_manage": "layers", "layer_info": "layers",
+    "feature_info": "features", "algorithm_info": "algorithms",
+    "processing_execute": "run_processing", "layout_manage": "layout",
+    "qml_style_manage": "style_file", "vector_data_manage": "vector_data",
+    "style_vector_graduated": "style_graduated",
+}
 
-def build_tools(bridge):
+
+def build_tools(bridge, *, compact=False):
     tools = []
-    for name, schema, description in SPECS:
+    specs = list(SPECS)
+    if getattr(bridge, "reliable", False):
+        from .task_tools import COMPACT_TASK_SPECS, TASK_SPECS
+
+        if compact:
+            algorithm_spec = next(spec for spec in SPECS if spec[0] == "algorithm_info")
+            specs = [algorithm_spec, *COMPACT_TASK_SPECS]
+        else:
+            algorithm_spec = next(spec for spec in SPECS if spec[0] == "algorithm_info")
+            specs = [
+                algorithm_spec,
+                ("layer_info", LayerList, "List current project layers without changing them."),
+                *TASK_SPECS,
+            ]
+    for name, schema, description in specs:
 
         def bind(operation, model):
             async def invoke(**kwargs):
@@ -196,7 +253,7 @@ def build_tools(bridge):
 
         tools.append(
             StructuredTool.from_function(
-                coroutine=bind(name, schema),
+                coroutine=bind(WORKER_OPERATIONS.get(name, name), schema),
                 name=name,
                 description=description,
                 args_schema=schema,
@@ -249,12 +306,12 @@ class GraduatedStyle(Arguments):
 SPECS.extend(
     [
         (
-            "style_file",
+            "qml_style_manage",
             StyleFile,
             "Save/load QGIS QML symbology including detailed renderer and labeling settings.",
         ),
         (
-            "vector_data",
+            "vector_data_manage",
             VectorData,
             "Select features by QGIS expression, clear selection, compute field statistics, create a memory layer from GeoJSON, or export vector data to GPKG/GeoJSON/SHP. Export supports selected features and target CRS.",
         ),
@@ -264,7 +321,7 @@ SPECS.extend(
             "Render rasters as contrast-stretched grayscale, RGB composite or live hillshade. For pseudocolor use style_raster. Hillshade z_factor must match horizontal/vertical units; use projected elevation data for physical slopes.",
         ),
         (
-            "style_graduated",
+            "style_vector_graduated",
             GraduatedStyle,
             "Classify a numeric vector field using equal interval, quantiles or Jenks with a QGIS color ramp.",
         ),

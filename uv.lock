@@ -4,8 +4,8 @@ requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
     "python_full_version >= '3.14' and sys_platform != 'win32'",
-    "python_full_version < '3.14' and sys_platform == 'win32'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'emscripten'",
+    "python_full_version < '3.14' and sys_platform == 'win32'",
     "(python_full_version < '3.12' and sys_platform == 'emscripten') or (python_full_version < '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32')",
 ]
 
@@ -1267,9 +1267,12 @@ name = "smart-qgis"
 version = "2.0.0"
 source = { editable = "." }
 dependencies = [
+    { name = "jsonschema" },
     { name = "langchain-core" },
     { name = "mcp" },
+    { name = "pillow" },
     { name = "pydantic" },
+    { name = "pypdf" },
 ]
 
 [package.dev-dependencies]
@@ -1283,9 +1286,12 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "jsonschema", specifier = ">=4,<5" },
     { name = "langchain-core", specifier = ">=1,<2" },
     { name = "mcp", specifier = ">=1.28,<2" },
+    { name = "pillow", specifier = ">=11" },
     { name = "pydantic", specifier = ">=2.11,<3" },
+    { name = "pypdf", specifier = ">=5" },
 ]
 
 [package.metadata.requires-dev]
