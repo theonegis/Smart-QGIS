@@ -40,7 +40,8 @@ def test_compact_reliable_surface_has_processing_discovery_and_typed_preparation
         tool.name: tool.args_schema.model_json_schema()
         for tool in build_tools(coordinator, compact=True)
     }
-    assert schemas["task_execute_next"]["required"] == ["continuation_token"]
+    assert schemas["task_execute_next"].get("properties", {}) == {}
+    assert schemas["task_execute_next"].get("required", []) == []
     assert schemas["task_execute_next"]["additionalProperties"] is False
     assert "repairs_step" in schemas["prepare_algorithm"]["properties"]
 

@@ -150,6 +150,122 @@ class TaskCoordinator:
             "arguments": {"continuation_token": self.issue_route(next_call)},
         }
 
+    def compact_route_handle(self):
+        """Return or rebuild the one current action route for token-free MCP clients."""
+        store = self.require_task()
+        task = store.task()
+        completed = store.db.execute(
+            "SELECT body FROM events WHERE kind='ROUTE_COMPLETED' ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        if task["status"] == "COMPLETED" and completed:
+            return json.loads(completed["body"])["route_id"]
+
+        issued = list(store.db.execute(
+            "SELECT body FROM events WHERE kind='ROUTE_ISSUED' ORDER BY sequence DESC"
+        ))
+        for row in issued:
+            route = json.loads(row["body"])
+            if (
+                route.get("state_version") == task["state_version"]
+                and route.get("contract_version") == task["contract_version"]
+            ):
+                return route["route_id"]
+
+        for row in issued:
+            route = json.loads(row["body"])
+            target = route.get("next_tool")
+            arguments = dict(route.get("arguments", {}))
+            if target == "task_execute":
+                step_id = arguments.get("step_id")
+                step = store.db.execute(
+                    "SELECT status FROM steps WHERE id=?", (step_id,)
+                ).fetchone()
+                if not step or step["status"] != "PLANNED":
+                    continue
+                continuation = self.issue_continuation("execute", step_id)
+            elif target == "presentation_continue":
+                if not self.presentation_pending():
+                    continue
+                continuation = self.issue_continuation()
+            elif target in {"workflow_run", "plan_execute"}:
+                if task["status"] != "READY":
+                    continue
+                continuation = self.issue_continuation()
+            else:
+                continue
+            arguments.update({
+                "task_id": store.task_id,
+                "continuation_token": continuation,
+            })
+            return self.issue_route({"tool": target, "arguments": arguments})
+
+        planned = list(store.db.execute(
+            "SELECT id FROM steps WHERE status='PLANNED' ORDER BY rowid"
+        ))
+        if len(planned) == 1:
+            step_id = planned[0]["id"]
+            return self.issue_route({
+                "tool": "task_execute",
+                "arguments": {
+                    "task_id": store.task_id,
+                    "step_id": step_id,
+                    "continuation_token": self.issue_continuation("execute", step_id),
+                },
+            })
+        raise TaskError(
+            "NO_PENDING_ACTION",
+            "The task has no unique server-bound action to execute",
+            next_action="Prepare the next Processing algorithm or inspect task_diagnose",
+        )
+
+    def compact_arguments(self, operation, arguments):
+        """Inject machine-owned state handles hidden from the compact MCP schema."""
+        arguments = dict(arguments)
+        if operation == "task_execute_next" and not arguments.get("continuation_token"):
+            arguments["continuation_token"] = self.compact_route_handle()
+            return arguments
+        if operation == "task_recover" and arguments.get("retry_step") and not arguments.get(
+            "continuation_token"
+        ):
+            task_id = arguments.get("task_id")
+            if self.store is None or self.store.task_id != task_id:
+                candidate = TaskStore(self.root, task_id)
+                if self.store:
+                    if self.store.unresolved():
+                        candidate.close()
+                        raise TaskError(
+                            "ATTEMPT_UNRESOLVED", "Reconcile the attached task first"
+                        )
+                    self.store.close()
+                self.store = candidate
+            arguments["continuation_token"] = self.issue_continuation()
+            return arguments
+        if operation in {
+            "prepare_algorithm", "task_answer", "task_invalidate",
+            "task_record_guidance",
+        } and not arguments.get("continuation_token"):
+            task_id = arguments.get("task_id")
+            if task_id is not None:
+                self.require_task(task_id)
+                arguments["continuation_token"] = self.issue_continuation()
+        return arguments
+
+    def compact_response(self, value):
+        """Remove machine handles from model-visible compact MCP responses."""
+        if isinstance(value, list):
+            return [self.compact_response(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        result = {
+            key: self.compact_response(item)
+            for key, item in value.items()
+            if key != "continuation_token"
+        }
+        next_call = result.get("next_call")
+        if isinstance(next_call, dict) and next_call.get("tool") == "task_execute_next":
+            result["next_call"] = {"tool": "task_execute_next", "arguments": {}}
+        return result
+
     def presentation_options(self):
         """Read durable, non-contract display choices supplied to ``task_start``."""
         row = self.require_task().db.execute(
@@ -1149,7 +1265,8 @@ class TaskCoordinator:
                 "next_tool": "prepare_algorithm",
                 "instructions": (
                     "This Processing step committed. If further analysis is needed, "
-                    "call prepare_algorithm with the returned continuation token; "
+                    "call prepare_algorithm with the task ID and algorithm parameters; "
+                    "the service owns continuation state. "
                     "automatic raster/vector working assets are now available."
                 ),
             })
@@ -1217,8 +1334,17 @@ class TaskCoordinator:
             )
 
         step_rows = list(self.store.db.execute("SELECT id,status,body FROM steps ORDER BY rowid"))
+        # A repaired presentation can invalidate its logical layout asset while
+        # the restored QGIS checkpoint still contains the physical layout.  Keep
+        # those names reserved so an automatic layout never collides with state
+        # that is intentionally retained for recovery evidence.
+        existing_layouts = {
+            name
+            for name in ((task.get("checkpoint") or {}).get("info") or {}).get("layouts", [])
+            if isinstance(name, str) and name
+        }
         reserved = (set(assets) | {item["id"] for item in task["deliverables"]}
-                    | {row["id"] for row in step_rows})
+                    | {row["id"] for row in step_rows} | existing_layouts)
 
         def unique_id(base):
             candidate, number = base[:128], 2
@@ -1299,6 +1425,10 @@ class TaskCoordinator:
         ), None)
         layout_id = (layout_outputs[0]["id"] if layout_outputs
                      else prior_layout or unique_id("map_layout"))
+        # An explicitly requested layout ID is part of the task output contract,
+        # so it cannot be silently renamed. Rebuilding that task-owned layout is
+        # safe; automatically named recovery layouts use a fresh suffix instead.
+        overwrite_layout = bool(layout_outputs and layout_id in existing_layouts)
         token_result = await run_step(
             "presentation_layout",
             {
@@ -1312,6 +1442,7 @@ class TaskCoordinator:
                     "scalebar": True, "grid": True,
                     "grid_crs": presentation["coordinate_crs"],
                     "map_element_placement": presentation.get("map_element_placement", "auto"),
+                    "overwrite": overwrite_layout,
                 },
                 "inputs": layer_ids,
                 "outputs": [{"id": layout_id, "kind": "layout", "binding": "layout"}],

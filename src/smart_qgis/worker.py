@@ -216,49 +216,54 @@ class Engine:
 
     @staticmethod
     def raster_summary(layer):
-        """Return compact output-health facts without turning them into acceptance rules."""
+        """Return exact compact output-health facts without adding acceptance rules."""
         from osgeo import gdal
 
-        dataset = gdal.Open(layer.source().split("|", 1)[0], gdal.GA_ReadOnly)
-        if dataset is None:
-            return None
-        bands = []
-        for index in range(1, dataset.RasterCount + 1):
-            band = dataset.GetRasterBand(index)
-            statistics_error = None
-            gdal.PushErrorHandler("CPLQuietErrorHandler")
-            try:
+        previous_pam = gdal.GetThreadLocalConfigOption("GDAL_PAM_ENABLED")
+        gdal.SetThreadLocalConfigOption("GDAL_PAM_ENABLED", "NO")
+        try:
+            dataset = gdal.Open(layer.source().split("|", 1)[0], gdal.GA_ReadOnly)
+            if dataset is None:
+                return None
+            bands = []
+            for index in range(1, dataset.RasterCount + 1):
+                band = dataset.GetRasterBand(index)
+                statistics_error = None
+                gdal.PushErrorHandler("CPLQuietErrorHandler")
                 try:
-                    statistics = band.GetStatistics(True, True)
-                except RuntimeError as exc:
-                    statistics = None
-                    statistics_error = str(exc)
-            finally:
-                gdal.PopErrorHandler()
-            valid_text = band.GetMetadataItem("STATISTICS_VALID_PERCENT")
-            try:
-                valid_percent = float(valid_text) if valid_text is not None else None
-            except ValueError:
-                valid_percent = None
-            all_nodata = valid_percent == 0 or (
-                statistics is None
-                and statistics_error is not None
-                and "no valid pixels" in statistics_error.casefold()
-            )
-            if all_nodata:
-                valid_percent = 0.0
-            bands.append({
-                "band": index,
-                "nodata": plain(band.GetNoDataValue()),
-                "valid_percent": valid_percent,
-                "minimum": None if all_nodata or not statistics else plain(statistics[0]),
-                "maximum": None if all_nodata or not statistics else plain(statistics[1]),
-            })
-        return {
-            "bands": bands,
-            "all_nodata": bool(bands) and all(item["valid_percent"] == 0 for item in bands),
-            "statistics_approximate": True,
-        }
+                    try:
+                        statistics = band.GetStatistics(False, True)
+                    except RuntimeError as exc:
+                        statistics = None
+                        statistics_error = str(exc)
+                finally:
+                    gdal.PopErrorHandler()
+                valid_text = band.GetMetadataItem("STATISTICS_VALID_PERCENT")
+                try:
+                    valid_percent = float(valid_text) if valid_text is not None else None
+                except ValueError:
+                    valid_percent = None
+                all_nodata = valid_percent == 0 or (
+                    statistics is None
+                    and statistics_error is not None
+                    and "no valid pixels" in statistics_error.casefold()
+                )
+                if all_nodata:
+                    valid_percent = 0.0
+                bands.append({
+                    "band": index,
+                    "nodata": plain(band.GetNoDataValue()),
+                    "valid_percent": valid_percent,
+                    "minimum": None if all_nodata or not statistics else plain(statistics[0]),
+                    "maximum": None if all_nodata or not statistics else plain(statistics[1]),
+                })
+            return {
+                "bands": bands,
+                "all_nodata": bool(bands) and all(item["valid_percent"] == 0 for item in bands),
+                "statistics_approximate": False,
+            }
+        finally:
+            gdal.SetThreadLocalConfigOption("GDAL_PAM_ENABLED", previous_pam)
 
     def ordered_layers(self):
         return list(self.project.layerTreeRoot().layerOrder())

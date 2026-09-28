@@ -14,8 +14,9 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from smart_qgis.bridge import QgisBridge, WorkerError
+from smart_qgis.contracts import StepContract
 from smart_qgis.coordinator import TaskCoordinator
-from smart_qgis.task_store import TaskError
+from smart_qgis.task_store import TaskError, TaskStore
 from smart_qgis.tools import build_tools
 
 pytestmark = pytest.mark.integration
@@ -470,8 +471,7 @@ async def test_contract_gated_map_completion_idempotence_and_server_resume(tmp_p
         await coordinator.close()
         coordinator = TaskCoordinator(QgisBridge(120), tmp_path / "state")
         tools = {tool.name: tool for tool in build_tools(coordinator)}
-        compact_tools = {tool.name: tool for tool in build_tools(coordinator, compact=True)}
-        status = await compact_tools["task_recover"].ainvoke({"task_id": task_id})
+        status = await tools["task_recover"].ainvoke({"task_id": task_id})
         status, result, _ = await step(
             tools,
             status,
@@ -574,11 +574,19 @@ async def test_default_mcp_exposes_tasks_and_returns_structured_contract_error(t
     async with stdio_client(params) as streams:
         async with ClientSession(*streams, read_timeout_seconds=timedelta(seconds=120)) as session:
             await session.initialize()
-            names = {tool.name for tool in (await session.list_tools()).tools}
-            assert names == {
+            advertised = (await session.list_tools()).tools
+            schemas = {tool.name: tool.inputSchema for tool in advertised}
+            assert set(schemas) == {
                 "algorithm_info", "task_start", "task_execute_next", "task_answer", "task_record_guidance", "task_invalidate", "task_recover", "task_diagnose",
                 "prepare_algorithm",
             }
+            for name in {
+                "task_execute_next", "task_answer", "task_record_guidance",
+                "task_invalidate", "task_recover", "prepare_algorithm",
+            }:
+                assert "continuation_token" not in schemas[name].get("properties", {})
+                assert "continuation_token" not in schemas[name].get("required", [])
+            assert schemas["task_execute_next"].get("properties", {}) == {}
 
 
 async def test_step_prepare_load_layout_and_save_recipes(tmp_path):
@@ -719,6 +727,97 @@ async def test_standard_map_workflow_runs_with_per_step_checkpoints(tmp_path):
         await coordinator.close()
 
 
+async def test_auto_presentation_rebuild_uses_fresh_layout_after_checkpoint_restore(tmp_path):
+    """A stale physical layout must not trap the compact recovery route."""
+    require_qgis()
+    source = tmp_path / "result.geojson"
+    source.write_text(json.dumps({
+        "type": "FeatureCollection",
+        "features": [{
+            "type": "Feature",
+            "properties": {"name": "Result"},
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[100, 30], [102, 30], [102, 32], [100, 32], [100, 30]]],
+            },
+        }],
+    }))
+    coordinator = TaskCoordinator(QgisBridge(120), tmp_path / "state")
+    coordinator.store = TaskStore.create(
+        tmp_path / "state",
+        "Create a repaired result map",
+        {},
+        [
+            {"id": "result", "kind": "vector", "description": "Final result"},
+            {"id": "map", "kind": "image", "description": "Result map"},
+        ],
+        {},
+    )
+    coordinator.store.save_contract({}, "initial", 0)
+    try:
+        await coordinator.bridge.call("project", {"action": "create"})
+        loaded = await coordinator.bridge.call(
+            "load_data", {"path": str(source), "kind": "vector", "name": "Result"}
+        )
+        await coordinator.bridge.call("layout", {
+            "action": "create", "name": "map_layout", "title": "Old map",
+            "layers": [loaded["id"]], "extent_layer": loaded["id"],
+            "legend": True, "scalebar": True, "grid": True,
+        })
+        analysis = StepContract(
+            operation="load_data",
+            arguments={"path": str(source), "kind": "vector"},
+            outputs=[{"id": "result", "kind": "vector", "binding": "layer"}],
+            reason="Fixture analysis output",
+        )
+        coordinator.store.save_step(
+            "analysis", analysis.model_dump(), [], coordinator.store.task()["state_version"]
+        )
+        coordinator.store.db.execute("UPDATE steps SET status='COMMITTED' WHERE id='analysis'")
+        style = StepContract(
+            operation="style_vector",
+            arguments={"layer": "asset:result"},
+            inputs=["result"],
+            reason="Fixture presentation style",
+        )
+        coordinator.store.save_step(
+            "presentation_style_result", style.model_dump(), ["analysis"],
+            coordinator.store.task()["state_version"],
+        )
+        coordinator.store.db.execute(
+            "UPDATE steps SET status='COMMITTED' WHERE id='presentation_style_result'"
+        )
+        coordinator.store.event("TASK_PRESENTATION", {
+            "title": "Repaired map", "raster_ramp": "Viridis", "dpi": 150,
+            "coordinate_crs": "EPSG:4326", "layers": None,
+        })
+        checkpoint = await coordinator.make_checkpoint(
+            coordinator.store.directory / "fixture-checkpoint",
+            {"result": {
+                "kind": "vector", "step_id": "analysis", "layer_id": loaded["id"],
+                "path": str(source),
+            }},
+        )
+        coordinator.store.db.execute(
+            "UPDATE task SET checkpoint=?", (json.dumps(checkpoint),)
+        )
+
+        result = await coordinator.auto_present_deliverables(coordinator.issue_continuation())
+
+        assert result["next_call"]["tool"] == "task_finish"
+        assert Path(result["assets"]["map"]["path"]).is_file()
+        assert (await coordinator.bridge.call("layout", {"action": "list"}))["layouts"] == [
+            "map_layout", "map_layout_2",
+        ]
+        layout_contract = json.loads(coordinator.store.db.execute(
+            "SELECT body FROM steps WHERE id='presentation_layout'"
+        ).fetchone()[0])
+        assert layout_contract["arguments"]["name"] == "map_layout_2"
+        assert layout_contract["arguments"]["overwrite"] is False
+    finally:
+        await coordinator.close()
+
+
 async def test_compact_task_run_inspects_routes_and_finishes_standard_map(tmp_path):
     require_qgis()
     source = tmp_path / "compact-input.geojson"
@@ -748,10 +847,9 @@ async def test_compact_task_run_inspects_routes_and_finishes_standard_map(tmp_pa
         assert routed["inspections"]["boundary"]["kind"] == "vector"
         assert routed["inspections"]["boundary"]["geometry_type"] == "Polygon"
         assert routed["next_call"]["tool"] == "task_execute_next"
-        assert set(routed["next_call"]["arguments"]) == {"continuation_token"}
-        assert len(routed["next_call"]["arguments"]["continuation_token"]) == 32
+        assert routed["next_call"]["arguments"] == {}
 
-        final = await tools["task_execute_next"].ainvoke(routed["next_call"]["arguments"])
+        final = await tools["task_execute_next"].ainvoke({})
         assert final["status"] == "COMPLETED"
         assert "continuation_token" not in final
         assert final["workflow"] == "standard_map_project"
@@ -763,11 +861,64 @@ async def test_compact_task_run_inspects_routes_and_finishes_standard_map(tmp_pa
         assert coordinator.store.db.execute(
             "SELECT count(*) FROM attempts WHERE status='COMMITTED'"
         ).fetchone()[0] == 4
-        replay = await tools["task_execute_next"].ainvoke(routed["next_call"]["arguments"])
+        replay = await tools["task_execute_next"].ainvoke({})
         assert replay == final
         assert coordinator.store.db.execute(
             "SELECT count(*) FROM attempts WHERE status='COMMITTED'"
         ).fetchone()[0] == 4
+    finally:
+        await coordinator.close()
+
+
+async def test_compact_processing_rebuilds_current_action_after_guidance_and_recovery(tmp_path):
+    require_qgis()
+    source = tmp_path / "polygon.geojson"
+    source.write_text(json.dumps({
+        "type": "FeatureCollection",
+        "features": [{
+            "type": "Feature",
+            "properties": {"name": "Area"},
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[100, 30], [101, 30], [101, 31], [100, 31], [100, 30]]],
+            },
+        }],
+    }))
+    coordinator = TaskCoordinator(QgisBridge(120), tmp_path / "compact-processing-state")
+    try:
+        tools = {tool.name: tool for tool in build_tools(coordinator, compact=True)}
+        started = await tools["task_start"].ainvoke({
+            "goal": "Create polygon centroids",
+            "inputs": {"area": {"path": str(source)}},
+            "deliverables": [
+                {"id": "centroids", "kind": "vector", "description": "Centroid points"}
+            ],
+        })
+        assert started["route"] == "processing_required"
+        prepared = await tools["prepare_algorithm"].ainvoke({
+            "task_id": started["task_id"],
+            "step_id": "create_centroids",
+            "algorithm": "native:centroids",
+            "inputs": {"INPUT": "area"},
+            "outputs": {"OUTPUT": "centroids"},
+        })
+        assert "continuation_token" not in prepared
+        assert prepared["next_call"] == {"tool": "task_execute_next", "arguments": {}}
+
+        version = coordinator.store.task()["state_version"]
+        await coordinator.clarify({
+            "task_id": started["task_id"],
+            "expected_state_version": version,
+            "question": "Continue the prepared centroid step?",
+            "user_response": "Yes, continue the same task.",
+        })
+        recovered = await tools["task_recover"].ainvoke({"task_id": started["task_id"]})
+        assert "continuation_token" not in recovered
+
+        final = await tools["task_execute_next"].ainvoke({})
+        assert final["status"] == "COMPLETED"
+        assert "continuation_token" not in final
+        assert Path(final["assets"]["centroids"]["path"]).is_file()
     finally:
         await coordinator.close()
 
@@ -1232,7 +1383,6 @@ async def test_repair_preserves_independent_results_and_project_state(tmp_path, 
         status = await compact_tools["task_invalidate"].ainvoke(
             {
                 "task_id": status["task_id"],
-                "continuation_token": status["continuation_token"],
                 "steps": [repair_target],
                 "reason": "Replace incorrect candidate",
             }
@@ -1932,9 +2082,27 @@ async def test_worker_preflights_qgis_raster_expression_and_reports_raster_healt
                 "maximum": 5.0,
             }],
             "all_nodata": False,
-            "statistics_approximate": True,
+            "statistics_approximate": False,
         }
         assert created["warnings"] == []
+        from PIL import Image
+
+        outlier_source = tmp_path / "outlier-source.tif"
+        image = Image.new("L", (1024, 1024), 14)
+        image.putpixel((1023, 1023), 37)
+        image.save(outlier_source)
+        outlier = await bridge.call("run_processing", {
+            "algorithm": "gdal:translate",
+            "parameters": {
+                "INPUT": str(outlier_source),
+                "OUTPUT": str(tmp_path / "outlier-copy.tif"),
+            },
+            "load_outputs": True,
+        })
+        outlier_summary = outlier["loaded_layers"][0]["raster_summary"]
+        assert outlier_summary["statistics_approximate"] is False
+        assert outlier_summary["bands"][0]["minimum"] == 14.0
+        assert outlier_summary["bands"][0]["maximum"] == 37.0
         nodata = await bridge.call("run_processing", {
             "algorithm": "gdal:translate",
             "parameters": {

@@ -12,9 +12,9 @@ Apply rules by information type and task state, not by memorizing a fixed tool c
 ## Reliable workflow
 
 1. If there is no task ID, the first Smart-QGIS domain call must be `task_start`, once, with the original goal, absolute input paths, requested deliverables, and an empty/minimal contract. Do not call `algorithm_info` before the task exists. Do not add acceptance rules beyond basic validity and explicit user requirements.
-2. If `task_start` returns `task_execute_next`, copy its opaque continuation token unchanged and call that tool. Do not rediscover a workflow the server already selected.
+2. If `task_start` returns `task_execute_next`, call it with no arguments. The compact MCP service owns the current machine action handle; do not copy, infer, or supply continuation tokens, and do not rediscover a workflow the server already selected.
 3. For a Processing route, determine one exact installed algorithm ID, then call `prepare_algorithm` once for that step. Bind logical task assets through `inputs`, managed results through `outputs`, and include only scalar parameters actually known from the user, inspected data, or live algorithm help. `prepare_algorithm` must read that exact help, mechanically normalize unambiguous name-case, JSON type, and enum-label representations, and pass native QGIS preflight before it creates an executable step contract.
-4. Call `task_execute_next` with only the returned server-bound handle. Continue the same task until it reports `COMPLETED`, asks a structured question, requires real user guidance, or demonstrates an irreducible blocker.
+4. Call `task_execute_next` with no arguments. Continue the same task until it reports `COMPLETED`, asks a structured question, requires real user guidance, or demonstrates an irreducible blocker.
 
 For multi-step Processing, work just-in-time: discover, prepare and execute the next semantic operation before searching for algorithms for later operations. Do not inventory a whole future toolchain up front. A future step may depend on the actual output metadata or error from the current step, and early searches enlarge local-model context without advancing the task.
 
@@ -59,6 +59,8 @@ When an expression contains a layer, field, or band reference, resolve the exact
 Never substitute an unquoted name, positional alias, path, or `asset:<id>` for a raster-band reference unless the selected algorithm explicitly documents that syntax. Use only operators and functions documented for that exact installed calculator. If execution reports `Error parsing formula`, preserve the error, recheck the layer names once with `read_current_project`, and correct one evidenced syntax issue. Do not cycle through guessed aliases or functions. If the required operation is not expressible with verified syntax, discover a dedicated installed algorithm or ask the user for a method hint.
 
 Read the raster summary returned for every new raster before using it downstream. A `RASTER_ALL_NODATA` warning or `raster_summary.all_nodata=true` is evidence that the step produced no usable pixels, even when the file opens successfully. Do not silently treat that warning as task progress or add a new acceptance rule: inspect the exact formula, input alignment and NoData handling, repair the evidenced cause once, or ask the user after the correction limit.
+
+Raster summaries in the compact reliable interface use full-resolution statistics and mark `statistics_approximate=false`. Values that drive scientific parameters, such as min-max normalization bounds, may be used only when that flag is false. If an older or external result explicitly reports approximate statistics, do not turn its sampled extrema into a formula; obtain exact statistics through an available inspection route or ask for guidance.
 
 ## Stop unproductive loops
 

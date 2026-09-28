@@ -17,7 +17,10 @@ class Project(Arguments):
     path: str | None = None
     crs: str = "EPSG:4326"
     title: str = "Smart-QGIS"
-    overwrite: bool = False
+    overwrite: bool = Field(
+        False,
+        description="Replace an existing project file at the requested managed output path",
+    )
 
 
 class Load(Arguments):
@@ -149,7 +152,10 @@ class Layout(Arguments):
         ),
     )
     path: str | None = Field(None, description="QPT template output path for action=template")
-    overwrite: bool = False
+    overwrite: bool = Field(
+        False,
+        description="Replace a same-named layout already stored in the current managed project",
+    )
 
 
 class Export(Arguments):
@@ -246,8 +252,13 @@ def build_tools(bridge, *, compact=False):
 
         def bind(operation, model):
             async def invoke(**kwargs):
-                arguments = model.model_validate(kwargs).model_dump()
-                return await bridge.call(operation, arguments)
+                arguments = model.model_validate(dict(kwargs)).model_dump()
+                if compact and hasattr(bridge, "compact_arguments"):
+                    arguments = bridge.compact_arguments(operation, arguments)
+                result = await bridge.call(operation, arguments)
+                if compact and hasattr(bridge, "compact_response"):
+                    result = bridge.compact_response(result)
+                return result
 
             return invoke
 

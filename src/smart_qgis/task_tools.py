@@ -141,9 +141,11 @@ class PlannedAlgorithm(Model):
 
 
 class TaskContinue(Model):
-    continuation_token: Nonempty = Field(
-        description="Opaque action token returned by task_start or the preceding task_execute_next; copy unchanged"
-    )
+    continuation_token: Nonempty = Field(description="Server-issued action handle")
+
+
+class CompactTaskContinue(Model):
+    """Token-free public shape; the compact service supplies the current action."""
 
 
 class TaskReference(Model):
@@ -151,17 +153,23 @@ class TaskReference(Model):
 
 
 class TaskContinuation(TaskReference):
-    continuation_token: Nonempty = Field(
-        description="Opaque token returned by the preceding task mutation; copy it unchanged",
-    )
+    continuation_token: Nonempty = Field(description="Latest server-issued task state token")
 
 
-class TaskAnswer(TaskContinuation):
+class TaskAnswerFields(TaskReference):
     question_id: SafeId = Field(description="Exact pending question ID returned by prepare_algorithm")
     answer: Any = Field(description="The user's actual value; never infer it")
 
 
-class PrepareAlgorithm(TaskContinuation):
+class TaskAnswer(TaskAnswerFields):
+    continuation_token: Nonempty
+
+
+class CompactTaskAnswer(TaskAnswerFields):
+    """Public answer shape; the compact service supplies the task state token."""
+
+
+class PrepareAlgorithmFields(TaskReference):
     """Prepare any installed QGIS Processing algorithm from registry metadata."""
 
     step_id: SafeId = Field(description="New unique logical step ID; reuse only when the service explicitly requests repair semantics")
@@ -197,6 +205,14 @@ class PrepareAlgorithm(TaskContinuation):
     repairs_step: SafeId | None = Field(
         None, description="Failed or invalidated step ID to replace. Use a NEW step_id, retain required checks, and reuse its logical output ID",
     )
+
+
+class PrepareAlgorithm(PrepareAlgorithmFields):
+    continuation_token: Nonempty
+
+
+class CompactPrepareAlgorithm(PrepareAlgorithmFields):
+    """Public preparation shape; the compact service supplies task state."""
 
 
 class TaskClarify(Model):
@@ -388,11 +404,19 @@ class Resume(TaskReference):
             raise argument_rule_error("retry_context")
         return self
 
-class TaskRepair(TaskContinuation):
+class TaskRepairFields(TaskReference):
     steps: list[SafeId] = Field(
         min_length=1, description="Committed producer steps with incorrect or unusable results"
     )
     reason: Nonempty = Field(description="Concrete evidence that the committed result is incorrect or unusable")
+
+
+class TaskRepair(TaskRepairFields):
+    continuation_token: Nonempty
+
+
+class CompactTaskRepair(TaskRepairFields):
+    """Public invalidation shape; the compact service supplies task state."""
 
 
 class TaskValidate(TaskReference):
@@ -532,16 +556,16 @@ COMPACT_TASK_SPECS = [
     (
         "task_start",
         TaskRun,
-        "First mutation for a new request. Declare exact logical inputs and deliverables once; use contract={} unless the user added acceptance checks. The service inspects inputs and returns either a Processing route or an exact task_execute_next handle.",
+        "First mutation for a new request. Declare exact logical inputs and deliverables once; use contract={} unless the user added acceptance checks. The service inspects inputs and returns either a Processing route or a no-argument task_execute_next call.",
     ),
     (
         "task_execute_next",
-        TaskContinue,
-        "Execute the exact server-bound next action. Pass only the latest opaque continuation_token unchanged; do not repeat task_id, step_id or GIS parameters. Continue until COMPLETED or a structured question/error is returned.",
+        CompactTaskContinue,
+        "Execute the current exact server-bound action with no arguments. The service owns its action handle and approved GIS parameters. Continue until COMPLETED or a structured question/error is returned.",
     ),
     (
         "task_answer",
-        TaskAnswer,
+        CompactTaskAnswer,
         "Record the user's actual answer to a required question. Repeating the same saved answer safely resumes interrupted preparation; a different answer is rejected. Never invent an answer.",
     ),
     (
@@ -551,7 +575,7 @@ COMPACT_TASK_SPECS = [
     ),
     (
         "task_invalidate",
-        TaskRepair,
+        CompactTaskRepair,
         "Invalidate an incorrect committed result and dependent steps without deleting evidence. Then use prepare_algorithm with repairs_step to replace the producer and reuse its output ID. Do not call this for an uncommitted failed step.",
     ),
     (
@@ -566,7 +590,7 @@ COMPACT_TASK_SPECS = [
     ),
     (
         "prepare_algorithm",
-        PrepareAlgorithm,
-        "Prepare one Processing step by exact installed provider:algorithm ID. Put only layer/source bindings in inputs, destinations in outputs, and known scalar/band/enum/CRS/expression values in parameters. Live help, normalization and native preflight run automatically; unknown required semantic values return structured questions.",
+        CompactPrepareAlgorithm,
+        "Prepare one Processing step by exact installed provider:algorithm ID. Use the stable task_id; the service owns task-state tokens. Put only layer/source bindings in inputs, destinations in outputs, and known scalar/band/enum/CRS/expression values in parameters. Live help, normalization and native preflight run automatically; unknown required semantic values return structured questions.",
     ),
 ]

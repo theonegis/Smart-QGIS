@@ -1,12 +1,10 @@
-# Agent 客户端接入
+# MCP 客户端接入
 
-Smart-QGIS 只提供后台 GIS 工具。客户端负责选择云端/本地模型、规划步骤、保留对话和审批工具调用。
-
-当前工作树默认启用新的 `reliable` 任务接口：Agent 创建任务并自动生成最小契约，再执行修改工具。见[可靠任务使用说明](reliable-usage.md)。`--execution-mode legacy` 仅用于论文中的旧直接工具消融基线，不是兼容承诺。`scripts/paper_case.py` 是旧基线示例；`scripts/client_case.py` 默认运行新接口，实验时可显式选择旧基线。两个模式的结果不能混用。
+Smart-QGIS 只提供后台 GIS 工具；模型、对话历史、思考超时和审批由客户端负责。默认使用 `reliable`；只有明确需要无任务日志的直接工具接口时，才在服务器参数里加入 `--execution-mode legacy`。请用绝对路径并确认输出目录。
 
 ## Codex
 
-在 Codex 的配置文件中添加（替换绝对路径）：
+在 Codex 配置中加入（替换仓库绝对路径）：
 
 ```toml
 [mcp_servers.smart_qgis]
@@ -16,42 +14,28 @@ startup_timeout_sec = 90
 tool_timeout_sec = 900
 ```
 
-也可使用 `codex mcp add smart_qgis -- /path/to/Smart-QGIS/.venv/bin/python -m smart_qgis.server`。重启客户端后检查 MCP 工具列表。交互使用保留客户端默认的工具审批策略。
+检查客户端实际列出的 Smart-QGIS 工具。非交互测试的自动审批只应在一次明确授权、隔离的实验配置中设置，不要改成全局无条件信任。
 
-`codex exec` 非交互验收不能弹出审批；本仓库 `scripts/client_case.py` 为一次明确授权的测试进程设置 `smart_qgis` 的 `default_tools_approval_mode="approve"`，不修改全局配置。脚本只应在确认输入和输出路径后执行。
+## Pi + Ollama
 
-## Hermes + Ollama
+Pi 需要其 MCP 适配扩展。可在项目/试次的独立 MCP 配置文件中注册服务器，再用 `pi --mcp-config /absolute/path/to/config.json` 启动；若在测试中自动批准工具调用，应只对这个明确配置的项目服务器授权，不修改全局信任策略。每个独立实验样本使用新的 Pi session；同一任务发生错误时继续原 session 和原 Smart-QGIS task ID。模型上下文、推理强度和思考计时由 Pi/Ollama 一侧设置，不能通过 MCP 的 `--timeout` 代替。
 
-在 Hermes 的 `config.yaml` 合并以下片段：
+配置文件中服务器条目的核心形式如下；适配扩展及审批字段按已安装 Pi 版本检查：
 
-```yaml
-model:
-  default: your-local-tool-calling-model
-  provider: custom
-  base_url: http://127.0.0.1:11434/v1
-  context_length: 65536
-  ollama_num_ctx: 65536  # Request the same runtime window; verify server support
-mcp_servers:
-  smart_qgis:
-    command: /path/to/Smart-QGIS/.venv/bin/python
-    args: ["-m", "smart_qgis.server"]
-    connect_timeout: 90
-    timeout: 900
-    supports_parallel_tool_calls: false
+```json
+{
+  "mcpServers": {
+    "smart-qgis": {
+      "command": "/path/to/Smart-QGIS/.venv/bin/python",
+      "args": ["-m", "smart_qgis.server"],
+      "directTools": true
+    }
+  }
+}
 ```
 
-使用 `ollama list` 选择已安装、支持工具调用的模型；确保模型实际上下文长度与 Hermes 配置一致。Hermes 的 CLI 工具集筛选参数使用服务器名称：`--toolsets smart_qgis`。
+## 共同约定
 
-不需要把模型放进 Smart-QGIS 的 Python 环境。客户端与 MCP 的 stdio 会话在整个工作流中保持连接；新 MCP 进程从空工程启动，可靠模式用 `task_recover` 附着已有任务并恢复检查点。必须沿用相同的 `SMART_QGIS_STATE_DIR`。
+可靠模式的标准地图/工程为 `task_start → task_execute_next()`；通用 Processing 为 `task_start → 确认算法 ID → prepare_algorithm → task_execute_next()`，仅在返回真实缺参问题时才询问用户并调用 `task_answer`。所有调用以当前会话的 MCP 工具列表和参数 schema 为准，不能猜不存在的工具。失败后诊断、用户指导及恢复见[用法说明](reliable-usage.md)。
 
-本地模型测试可指定 `--context-length` 和可选 `--reasoning-effort`。标准制图只需 `task_start → task_execute_next`；第二次调用只复制一个 opaque token。通用处理使用精确算法 ID 调用 `prepare_algorithm`，按需以 `task_answer` 回答其结构化问题；成功路径不要插入 `task_diagnose`。详见[性能诊断及对照计划](local-model-performance.md)。
-
-## 通用注意事项
-
-- 可靠模式通过任务诊断和只读发现接口检查环境；`project_manage` 等直接 GIS 工具只在论文旧接口基线中公开。
-- 标准地图/工程使用 `task_start → task_execute_next`；通用 Processing 使用 `prepare_algorithm → task_answer（仅缺参时）→ task_execute_next`。
-- 工具调用失败会返回 MCP `isError`；客户端应根据错误修正参数，不应把失败当成功。
-- 同一会话工具调用串行执行。多个客户端分别启动 MCP 时相互隔离，不能同时写同一个输出文件。
-- 本服务是可信本地工具，具有进程用户的文件和网络权限；它不是多租户沙箱。不要将 stdio 包装为未鉴权的公网服务。
-
-参考：[Codex MCP](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)、[Hermes MCP 配置](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/reference/mcp-config-reference.md)。
+一个 MCP 进程的 QGIS 操作串行执行。不同客户端不应同时写同一任务状态目录或输出文件。新进程须用相同 `SMART_QGIS_STATE_DIR` 和原 task ID 恢复。该本地工具具有运行用户的文件权限，不应直接暴露为无鉴权公网服务。

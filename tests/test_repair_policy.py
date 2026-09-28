@@ -226,6 +226,80 @@ async def test_resume_issues_compact_route_for_pending_processing_map(coordinato
     present.assert_awaited_once()
 
 
+@pytest.mark.parametrize(
+    ("map_deliverable", "physical_layout", "expected_name", "expected_overwrite"),
+    [
+        ({"id": "map", "kind": "image", "description": "Map image"},
+         "map_layout", "map_layout_2", False),
+        ({"id": "final_layout", "kind": "layout", "description": "Editable layout"},
+         "final_layout", "final_layout", True),
+    ],
+)
+async def test_auto_presentation_rebuild_handles_layout_retained_in_checkpoint(
+    tmp_path, monkeypatch, map_deliverable, physical_layout, expected_name,
+    expected_overwrite,
+):
+    co = TaskCoordinator(root=tmp_path)
+    co.store = TaskStore.create(
+        tmp_path,
+        "Build a repaired risk map",
+        {},
+        [
+            {"id": "result", "kind": "raster", "description": "Final raster"},
+            map_deliverable,
+        ],
+        {},
+    )
+    co.store.save_contract({}, "initial", 0)
+    checkpoint = {
+        "assets": {
+            "result": {
+                "kind": "raster", "step_id": "analysis", "layer_id": "layer-1",
+                "path": str(tmp_path / "result.tif"),
+            },
+        },
+        "info": {"layouts": [physical_layout]},
+    }
+    co.store.db.execute("UPDATE task SET checkpoint=?", (json.dumps(checkpoint),))
+    co.store.event("TASK_PRESENTATION", {
+        "title": "Risk map", "raster_ramp": "Viridis", "dpi": 150,
+        "coordinate_crs": "EPSG:4326", "layers": None,
+    })
+    style = StepContract(
+        operation="style_raster",
+        arguments={"layer": "asset:result", "ramp": "Viridis", "band": 1,
+                   "classes": 8, "opacity": 1},
+        inputs=["result"],
+        reason="Already styled",
+    )
+    co.store.save_step(
+        "presentation_style_result", style.model_dump(), [],
+        co.store.task()["state_version"],
+    )
+    co.store.db.execute(
+        "UPDATE steps SET status='COMMITTED' WHERE id='presentation_style_result'"
+    )
+
+    class CapturedLayout(Exception):
+        pass
+
+    captured = {}
+
+    async def capture_layout(payload):
+        captured.update(payload["contract"]["arguments"])
+        raise CapturedLayout
+
+    monkeypatch.setattr(co, "submit_step_contract", capture_layout)
+    try:
+        with pytest.raises(CapturedLayout):
+            await co.auto_present_deliverables(co.issue_continuation())
+        assert captured["name"] == expected_name
+        assert captured["overwrite"] is expected_overwrite
+    finally:
+        co.store.close()
+        co.traces.close()
+
+
 @pytest.mark.parametrize('repair_target', ['original', 'dependent'])
 def test_invalidated_success_can_recompute_unchanged_but_failed_replay_cannot(coordinator, repair_target):
     check = {"id": "crs", "kind": "crs", "target": "dem", "expected": "EPSG:3857",
