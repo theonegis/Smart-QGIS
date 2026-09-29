@@ -612,6 +612,15 @@ class Engine:
         if unknown:
             raise InvalidParameters(f"Unknown algorithm parameters: {sorted(unknown)}")
         # Only resolve IDs in input layer parameters: never reinterpret output names/expressions.
+        # GRASS Processing is an exception to the usual path-or-layer QGIS convention.
+        # Its provider dereferences a raster/vector source as a project layer while
+        # constructing a GRASS location.  A bare file path can therefore become
+        # ``None`` inside the provider (and later fail at ``layer.crs()``).  Bind
+        # task-owned file inputs to real project layers before GRASS sees them.
+        is_grass = (
+            alg.id().casefold().startswith("grass:")
+            or alg.provider().id().casefold().startswith("grass")
+        )
         for definition in alg.parameterDefinitions():
             key = definition.name()
             if key not in params or definition.isDestination():
@@ -619,7 +628,14 @@ class Engine:
             if definition.type() in {"source", "vector", "raster", "maplayer", "multilayer"}:
 
                 def resolve_id(v):
-                    return self.project.mapLayer(v) or v if isinstance(v, str) else v
+                    if not isinstance(v, str):
+                        return v
+                    layer = self.project.mapLayer(v)
+                    if layer is not None:
+                        return layer
+                    if is_grass:
+                        return self.grass_input_layer(v, definition.type())
+                    return v
 
                 params[key] = (
                     [resolve_id(v) for v in params[key]]
@@ -641,6 +657,48 @@ class Engine:
         if not valid:
             raise InvalidParameters(message)
         return alg, params, context
+
+    def grass_input_layer(self, reference, parameter_type):
+        """Materialize a file source as a valid project layer for GRASS.
+
+        Other Processing providers normally accept file paths directly.  The
+        QGIS GRASS provider, however, later calls ``layer.crs()`` on its input,
+        so a path which it cannot resolve to a project layer causes an internal
+        AttributeError rather than a useful parameter error.
+        """
+        for layer in self.project.mapLayers().values():
+            if layer.source() == reference:
+                return layer
+
+        source = reference.split("|", 1)[0]
+        path = Path(source)
+        if not path.is_absolute() or not path.is_file():
+            return reference
+
+        name = path.stem
+        layer_types = (
+            (QgsRasterLayer,) if parameter_type == "raster"
+            else (QgsVectorLayer,) if parameter_type == "vector"
+            else (QgsRasterLayer, QgsVectorLayer)
+        )
+        layer = None
+        for layer_type in layer_types:
+            candidate = (
+                QgsRasterLayer(reference, name, "gdal")
+                if layer_type is QgsRasterLayer
+                else QgsVectorLayer(reference, name, "ogr")
+            )
+            if candidate.isValid():
+                layer = candidate
+                break
+        if layer is None:
+            return reference
+        if not layer.crs().isValid():
+            raise InvalidParameters(
+                f"GRASS Processing input has no valid CRS: {reference}"
+            )
+        self.project.addMapLayer(layer)
+        return layer
 
     def processing_preflight(self, a):
         self.prepare_processing(a)

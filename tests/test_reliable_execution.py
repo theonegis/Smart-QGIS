@@ -2129,3 +2129,41 @@ async def test_worker_preflights_qgis_raster_expression_and_reports_raster_healt
         assert "double-quoted layer@band" in str(failure.value)
     finally:
         await bridge.close()
+
+
+async def test_grass_processing_materializes_managed_raster_source(tmp_path):
+    """GRASS must receive a QgsRasterLayer, not a bare managed file path."""
+    require_qgis()
+    bridge = QgisBridge(120)
+    try:
+        available = await bridge.call("algorithms", {
+            "action": "list", "provider": "grass", "query": "r.neighbors",
+        })
+        if not any(item["id"] == "grass:r.neighbors" for item in available["algorithms"]):
+            pytest.skip("Requires the QGIS GRASS Processing Provider")
+        source = tmp_path / "constant.tif"
+        await bridge.call("run_processing", {
+            "algorithm": "native:createconstantrasterlayer",
+            "parameters": {
+                "EXTENT": "0,10,0,10 [EPSG:3857]",
+                "TARGET_CRS": "EPSG:3857",
+                "PIXEL_SIZE": 1,
+                "NUMBER": 5,
+                "OUTPUT": str(source),
+            },
+            "load_outputs": False,
+        })
+        result = await bridge.call("run_processing", {
+            "algorithm": "grass:r.neighbors",
+            "parameters": {
+                "input": str(source), "method": 5, "size": 3,
+                "output": str(tmp_path / "range.tif"),
+            },
+            "load_outputs": True,
+        })
+        assert result["loaded_layers"][0]["crs"] == "EPSG:3857"
+        summary = result["loaded_layers"][0]["raster_summary"]
+        assert not summary["all_nodata"]
+        assert summary["bands"][0]["maximum"] == 0.0
+    finally:
+        await bridge.close()
