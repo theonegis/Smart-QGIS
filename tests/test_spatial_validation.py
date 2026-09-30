@@ -240,7 +240,10 @@ from qgis.core import (QgsLayoutItemLabel,QgsLayoutItemLegend,QgsLayoutItemPictu
 engine=worker.Engine()
 try:
  layer=engine.load_data({'path':sys.argv[2],'kind':'vector'})
- engine.layout({'name':'Map','layers':[layer['id']],'extent_layer':layer['id'],'title':'Required title','north_arrow':True})
+ engine.layout({'name':'Map','layers':[layer['id']],'extent_layer':layer['id'],'title':'Required title','north_arrow':True,
+                'map_elements':{'legend':{'frame':'inside','anchor':'top_right'},
+                                'scalebar':{'frame':'inside','anchor':'bottom_right'},
+                                'north_arrow':{'frame':'inside','anchor':'top_left'}}})
  layout=engine.project.layoutManager().layoutByName('Map')
  request={'check':{'id':'content','kind':'layout_content','target':'map','texts':['Required title'],
                   'require_title':True,'require_legend':True,'require_scalebar':True,'require_north_arrow':True,
@@ -259,6 +262,9 @@ try:
           and item.positionWithUnits().y()+item.sizeWithUnits().height()
               <=map_item.positionWithUnits().y()+map_item.sizeWithUnits().height())
  reports['inside']={'legend':inside(legend),'scale':inside(scale)}
+ reports['inside_gap']={'legend_top':legend.positionWithUnits().y()-map_item.positionWithUnits().y(),
+                        'legend_right':map_item.positionWithUnits().x()+map_item.sizeWithUnits().width()-(legend.positionWithUnits().x()+legend.sizeWithUnits().width()),
+                        'scale_bottom':map_item.positionWithUnits().y()+map_item.sizeWithUnits().height()-(scale.positionWithUnits().y()+scale.sizeWithUnits().height())}
  reports['geometry']={'map':[map_item.positionWithUnits().x(),map_item.positionWithUnits().y(),map_item.sizeWithUnits().width(),map_item.sizeWithUnits().height()], 'scale':[scale.positionWithUnits().x(),scale.positionWithUnits().y(),scale.sizeWithUnits().width(),scale.sizeWithUnits().height()]}
  scale.setExcludeFromExports(True);reports['hidden']=engine.dispatch('_validate',request);scale.setExcludeFromExports(False)
  scale.setLinkedMap(None);reports['unlinked']=engine.dispatch('_validate',request);scale.setLinkedMap(map_item)
@@ -284,8 +290,10 @@ try:
  outer_map=outside.itemById('main-map')
  outer_legend=next(i for i in outside.items() if isinstance(i,QgsLayoutItemLegend))
  outer_scale=next(i for i in outside.items() if isinstance(i,QgsLayoutItemScaleBar))
- reports['outside']=(outer_legend.positionWithUnits().y()>=outer_map.positionWithUnits().y()+outer_map.sizeWithUnits().height()
-                     and outer_scale.positionWithUnits().y()>=outer_map.positionWithUnits().y()+outer_map.sizeWithUnits().height())
+ reports['outside']={'legend_bottom_gap':outer_legend.positionWithUnits().y()-(outer_map.positionWithUnits().y()+outer_map.sizeWithUnits().height()),
+                     'scale_bottom_gap':outer_scale.positionWithUnits().y()-(outer_map.positionWithUnits().y()+outer_map.sizeWithUnits().height()),
+                     'legend_left_delta':outer_legend.positionWithUnits().x()-outer_map.positionWithUnits().x(),
+                     'scale_right_delta':outer_map.positionWithUnits().x()+outer_map.sizeWithUnits().width()-(outer_scale.positionWithUnits().x()+outer_scale.sizeWithUnits().width())}
  reports['placements']=placement['resolved_element_placements']
  outside_check={'check':{'id':'outside-content','kind':'layout_content','target':'outside',
                          'require_legend':True,'require_scalebar':True,'require_north_arrow':True,
@@ -294,6 +302,62 @@ try:
                                                'north_arrow':{'frame':'inside','anchor':'top_left'}}},
                 'assets':{'outside':{'layout':'Outside'}}}
  reports['placement_valid']=engine.dispatch('_validate',outside_check)
+ raster=engine.load_data({'path':sys.argv[3],'kind':'raster'})
+ raster_auto=engine.layout({'name':'Raster auto','layers':[raster['id']],'extent_layer':raster['id']})
+ raster_layout=engine.project.layoutManager().layoutByName('Raster auto')
+ raster_map=raster_layout.itemById('main-map')
+ raster_legend=next(i for i in raster_layout.items() if isinstance(i,QgsLayoutItemLegend))
+ raster_scale=next(i for i in raster_layout.items() if isinstance(i,QgsLayoutItemScaleBar))
+ raster_title=next(i for i in raster_layout.items() if isinstance(i,QgsLayoutItemLabel) and i.id()=='map-title')
+ raster_left=min(raster_legend.positionWithUnits().x(),raster_scale.positionWithUnits().x())
+ raster_right=max(raster_legend.positionWithUnits().x()+raster_legend.sizeWithUnits().width(),raster_scale.positionWithUnits().x()+raster_scale.sizeWithUnits().width())
+ reports['raster_auto']={'placements':raster_auto['resolved_element_placements'],
+                         'flow':raster_auto['legend_flow'],
+                         'legend_left_delta':raster_legend.positionWithUnits().x()-raster_map.positionWithUnits().x(),
+                         'scale_right_delta':raster_map.positionWithUnits().x()+raster_map.sizeWithUnits().width()-(raster_scale.positionWithUnits().x()+raster_scale.sizeWithUnits().width()),
+                         'bottom_gap':raster_legend.positionWithUnits().y()-(raster_map.positionWithUnits().y()+raster_map.sizeWithUnits().height()),
+                         'annotation_font_size':raster_map.grids().asList()[0].annotationTextFormat().size(),
+                         'title_font_size':raster_title.textFormat().size(),
+                         'legend_size':[raster_legend.sizeWithUnits().width(),raster_legend.sizeWithUnits().height()],
+                         'page_edge_gaps':{
+                           'left':raster_map.positionWithUnits().x(),
+                           'top':raster_map.positionWithUnits().y(),
+                           'right':raster_layout.pageCollection().pages()[0].pageSize().width()-(raster_map.positionWithUnits().x()+raster_map.sizeWithUnits().width()),
+                           'bottom':raster_layout.pageCollection().pages()[0].pageSize().height()-(raster_map.positionWithUnits().y()+raster_map.sizeWithUnits().height())},
+                         'width_coverage':raster_auto['map_frame_width_coverage'],
+                         'height_coverage':raster_auto['map_frame_height_coverage']}
+ long_layers=[raster['id']]
+ for index in range(3):
+  long_layers.append(engine.load_data({'path':sys.argv[3],'kind':'raster','name':f'Raster {index + 2}'})['id'])
+ long_auto=engine.layout({'name':'Long legend auto','layers':long_layers,'extent_layer':raster['id']})
+ long_layout=engine.project.layoutManager().layoutByName('Long legend auto')
+ long_legend=next(i for i in long_layout.items() if isinstance(i,QgsLayoutItemLegend))
+ long_scale=next(i for i in long_layout.items() if isinstance(i,QgsLayoutItemScaleBar))
+ reports['long_auto']={'placements':long_auto['resolved_element_placements'],
+                       'flow':long_auto['legend_flow'],
+                       'legend_x':long_legend.positionWithUnits().x(),
+                       'scale_x':long_scale.positionWithUnits().x(),
+                       'right_gap':long_legend.positionWithUnits().x()-(long_layout.itemById('main-map').positionWithUnits().x()+long_layout.itemById('main-map').sizeWithUnits().width()),
+                       'scale_right_page_gap':long_layout.pageCollection().pages()[0].pageSize().width()-(long_scale.positionWithUnits().x()+long_scale.sizeWithUnits().width()),
+                       'width_coverage':long_auto['map_frame_width_coverage'],
+                       'height_coverage':long_auto['map_frame_height_coverage']}
+ # Force a tall footer legend: this used to run below the page and be
+ # clipped. The server must lower its automatic frame target rather than
+ # exporting an incomplete legend.
+ tall_footer=engine.layout({'name':'Tall footer','layers':long_layers,'extent_layer':raster['id'],
+                            'map_elements':{'legend':{'frame':'outside','anchor':'bottom_left','flow':'vertical'},
+                                            'scalebar':{'frame':'outside','anchor':'bottom_right'}}})
+ tall_layout=engine.project.layoutManager().layoutByName('Tall footer')
+ tall_page=tall_layout.pageCollection().pages()[0].pageSize()
+ tall_items=[tall_layout.itemById('main-map'),tall_layout.itemById('map-title'),
+             next(i for i in tall_layout.items() if isinstance(i,QgsLayoutItemLegend)),
+             next(i for i in tall_layout.items() if isinstance(i,QgsLayoutItemScaleBar))]
+ def page_gap(item):
+  point=item.positionWithUnits(); size=item.sizeWithUnits()
+  return min(point.x(),point.y(),tall_page.width()-(point.x()+size.width()),tall_page.height()-(point.y()+size.height()))
+ reports['tall_footer']={'height_coverage':tall_footer['map_frame_height_coverage'],
+                         'minimum_item_page_gap':min(page_gap(item) for item in tall_items),
+                         'bounds_verified':tall_footer['layout_item_bounds_verified']}
  adaptive=engine.layout({'name':'修订地图','layers':[layer['id']],'extent_layer':layer['id'],
                          'title':'基于 DEM 的崎岖度计算结果制图','legend_title':'地形崎岖度',
                          'page_orientation':'auto','map_frame':{'mode':'maximize','min_page_coverage':0.55}})
@@ -305,7 +369,9 @@ try:
                       'coverage':adaptive['map_frame_page_coverage'],
                       'orientation':adaptive['page_orientation'],
                       'map_width':revised_map.sizeWithUnits().width(),
-                      'page_width':adaptive['width_mm']}
+                      'page_width':adaptive['width_mm'],
+                      'width_coverage':adaptive['map_frame_width_coverage'],
+                      'height_coverage':adaptive['map_frame_height_coverage']}
  reports['revision']['title_centered']=next(i for i in revised.items() if isinstance(i,QgsLayoutItemLabel) and i.id()=='map-title').hAlign() == Qt.AlignmentFlag.AlignHCenter
  reports['revision']['north_arrows']=len([i for i in revised.items() if isinstance(i,QgsLayoutItemPicture) and i.id()=='map-north-arrow'])
  coverage_check={'check':{'id':'coverage','kind':'layout_content','target':'revised','min_page_coverage':0.55},'assets':{'revised':{'layout':'修订地图'}}}
@@ -321,18 +387,52 @@ finally: engine.close()
 '''
     result = await asyncio.to_thread(
         subprocess.run, [executable, "-c", code, str(Path("src/smart_qgis").resolve()),
-                         str(spatial_data / "mask.gpkg")],
+                         str(spatial_data / "mask.gpkg"), str(spatial_data / "source.tif")],
         env=env, capture_output=True, text=True, timeout=60,
     )
     assert result.returncode == 0, result.stderr
     reports = json.loads(result.stdout)
     geometry = reports.pop("geometry")
     assert reports.pop("inside") == {"legend": True, "scale": True}, geometry
-    assert reports.pop("language") == "图例", reports
-    assert reports.pop("language_override") == "Legend", reports
-    assert reports.pop("outside"), reports
+    assert min(reports.pop("inside_gap").values()) >= 6, geometry
+    # One-layer legends use the layer name already rendered by QGIS rather
+    # than duplicating it with a generic title.
+    assert reports.pop("language") == "", reports
+    assert reports.pop("language_override") == "", reports
+    outside = reports.pop("outside")
+    assert outside["legend_bottom_gap"] >= 8 and outside["scale_bottom_gap"] >= 8, outside
+    assert abs(outside["legend_left_delta"]) < 0.5 and abs(outside["scale_right_delta"]) < 0.5, outside
     assert reports.pop("placements")["legend"] == {"frame": "outside", "anchor": "bottom_left"}, reports
     assert reports.pop("placement_valid")["status"] == "passed", reports
+    raster_auto = reports.pop("raster_auto")
+    assert raster_auto["placements"]["legend"] == {"frame": "outside", "anchor": "bottom_left"}, raster_auto
+    assert raster_auto["placements"]["scalebar"] == {"frame": "outside", "anchor": "bottom_right"}, raster_auto
+    assert raster_auto["flow"] == "horizontal", raster_auto
+    assert abs(raster_auto["legend_left_delta"]) < 0.5, raster_auto
+    assert abs(raster_auto["scale_right_delta"]) < 0.5, raster_auto
+    assert raster_auto["bottom_gap"] >= 8, raster_auto
+    assert raster_auto["annotation_font_size"] >= 42, raster_auto
+    assert raster_auto["title_font_size"] >= raster_auto["annotation_font_size"] + 6, raster_auto
+    assert min(raster_auto["legend_size"]) > 0, raster_auto
+    assert raster_auto["page_edge_gaps"]["left"] >= 36, raster_auto
+    assert raster_auto["page_edge_gaps"]["right"] >= 36, raster_auto
+    assert raster_auto["page_edge_gaps"]["top"] >= 62, raster_auto
+    assert raster_auto["page_edge_gaps"]["bottom"] >= 70, raster_auto
+    assert raster_auto["width_coverage"] >= 0.80, raster_auto
+    assert raster_auto["height_coverage"] >= 0.80, raster_auto
+    long_auto = reports.pop("long_auto")
+    assert long_auto["placements"]["legend"] == {"frame": "outside", "anchor": "top_right"}, long_auto
+    assert long_auto["placements"]["scalebar"] == {"frame": "outside", "anchor": "bottom_right"}, long_auto
+    assert long_auto["flow"] == "vertical", long_auto
+    assert abs(long_auto["legend_x"] - long_auto["scale_x"]) < 0.5, long_auto
+    assert long_auto["right_gap"] >= 8, long_auto
+    assert long_auto["scale_right_page_gap"] >= 10, long_auto
+    assert long_auto["width_coverage"] >= 0.80, long_auto
+    assert long_auto["height_coverage"] >= 0.80, long_auto
+    tall_footer = reports.pop("tall_footer")
+    assert tall_footer["bounds_verified"], tall_footer
+    assert tall_footer["minimum_item_page_gap"] >= 12, tall_footer
+    assert tall_footer["height_coverage"] < 0.80, tall_footer
     revision = reports.pop("revision")
     assert revision["title"] == "基于 DEM 的崎岖度计算结果制图", revision
     assert revision["legend"] == "地形崎岖度", revision
@@ -340,6 +440,8 @@ finally: engine.close()
     assert revision["north_arrows"] == 0, revision
     assert revision["orientation"] == "portrait", revision
     assert revision["coverage"] > 0.55, revision
+    assert revision["width_coverage"] >= 0.80, revision
+    assert revision["height_coverage"] >= 0.80, revision
     assert revision["map_width"] > revision["page_width"] * 0.55, revision
     assert reports.pop("coverage")["status"] == "passed", reports
     assert reports.pop("good")["status"] == "passed", reports
@@ -944,10 +1046,12 @@ async def test_generated_raster_legend_pixels_survive_worker_replacement(spatial
         with Image.open(before) as a, Image.open(after) as b:
             assert a.size == b.size
             # QGIS/Qt may vary antialiasing by a few RGB levels across fresh
-            # processes.  Verify visual equivalence instead of byte identity;
-            # a missing legend or renderer would exceed both tight bounds.
+            # processes. Larger reader-facing legend fonts make the harmless
+            # edge variation slightly wider. Verify visual equivalence instead
+            # of byte identity; a missing legend or renderer exceeds both
+            # bounds by orders of magnitude.
             difference = ImageChops.difference(a.convert('RGB'), b.convert('RGB'))
-            assert max(high for _, high in difference.getextrema()) <= 5
+            assert max(high for _, high in difference.getextrema()) <= 10
             assert sum(ImageStat.Stat(difference).mean) < 0.001
     finally:
         await bridge.close()
@@ -992,6 +1096,42 @@ print(json.dumps({'opacity':layer.opacity(),'items':[
         assert rendered['opacity'] == 0.5
         assert 'Priority area' in rendered['items']
         assert not any('Band 1' in item for item in rendered['items']), rendered
+    finally:
+        await bridge.close()
+
+
+async def test_continuous_raster_legend_hides_internal_band_name(spatial_data):
+    bridge = QgisBridge(120)
+    try:
+        loaded = await bridge.call('load_data', {
+            'path': str(spatial_data / 'source.tif'), 'kind': 'raster', 'name': 'Terrain ruggedness',
+        })
+        await bridge.call('style_raster', {
+            'layer': loaded['id'], 'mode': 'continuous', 'band': 1, 'ramp': 'Viridis',
+        })
+        await bridge.call('layout', {
+            'name': 'Map', 'title': 'Terrain ruggedness', 'layers': [loaded['id']],
+            'extent_layer': loaded['id'],
+        })
+        checkpoint = await bridge.call('_snapshot', {
+            'directory': str(spatial_data / 'continuous-checkpoint'),
+        })
+        executable, env = worker_environment()
+        code = '''
+import json,sys
+from qgis.core import QgsApplication,QgsLayoutItemLegend,QgsProject
+app=QgsApplication([],False);app.initQgis()
+project=QgsProject.instance();assert project.read(sys.argv[1])
+legend=next(item for item in project.layoutManager().layoutByName('Map').items() if isinstance(item,QgsLayoutItemLegend))
+node=legend.model().rootGroup().findLayers()[0]
+print(json.dumps([str(item.data(0)) for item in legend.model().layerLegendNodes(node)]))
+'''
+        result = subprocess.run([executable, '-c', code, checkpoint['project']],
+                                env=env, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        labels = json.loads(result.stdout)
+        assert not any('Band 1' in label for label in labels), labels
+        assert labels, labels
     finally:
         await bridge.close()
 

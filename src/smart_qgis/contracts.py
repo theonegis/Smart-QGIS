@@ -29,10 +29,10 @@ class MapElementPlacement(Model):
     """One optional, user-directed placement constraint for a map item."""
 
     frame: MapElementFrame | None = Field(
-        None, description="inside the map frame, outside it on the page, or null for server choice"
+        None, description="inside, adjacent outside, or null"
     )
     anchor: MapElementAnchor | None = Field(
-        None, description="Nine-position anchor or null for server choice"
+        None, description="Map-frame anchor or null"
     )
 
     @model_validator(mode="after")
@@ -94,6 +94,10 @@ class MapFrame(Model):
         None, ge=0.2, le=0.9,
         description="Optional user-required minimum fraction of page area occupied by the map frame",
     )
+    min_page_dimension_coverage: float = Field(
+        0.80, ge=0.80, le=0.95,
+        description="Preferred main-map fraction of both page dimensions; the server may relax it only to keep visible map elements inside the page",
+    )
 
 
 class CoordinateAnnotations(Model):
@@ -115,8 +119,8 @@ class CoordinateAnnotations(Model):
         None,
         description="For geographic labels, show or hide E/W/N/S; null keeps the server default",
     )
-    density: Literal["auto", "dense", "sparse"] = Field(
-        "auto", description="Common coordinate tick/label density preset"
+    density: Literal["sparse", "moderate", "dense"] = Field(
+        "moderate", description="Coordinate tick/label density preset; moderate is the default"
     )
     grid_lines: bool = Field(
         False, description="Draw interior grid lines in addition to frame ticks and labels"

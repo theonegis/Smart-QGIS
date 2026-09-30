@@ -357,7 +357,7 @@ class TaskRun(Model):
         None,
         description="Optional logical map layer IDs, topmost first. They may be planned Processing outputs or context inputs; omit to map final outputs",
     )
-    title: str | None = Field(None, description="Reader-facing map title; defaults to the user goal")
+    title: str | None = Field(None, description="Reader-facing map title; omit for a concise title derived from the task goal")
     legend_title: str | None = Field(
         None, description="Reader-facing legend heading; omit for a language-aware default"
     )
@@ -803,7 +803,7 @@ class StepPrepare(TaskContinuation):
         None, description="New logical output ID without asset: or output: prefix"
     )
     target_crs: str | None = Field(None, description="User-selected target CRS")
-    title: str | None = Field(None, description="Map title; defaults to the task goal")
+    title: str | None = Field(None, description="Map title; omit for a concise title derived from the task goal")
     legend_title: str | None = Field(None, description="Optional reader-facing legend heading")
     map_language: Literal["auto", "zh", "en"] = "auto"
     show_legend_title: bool = True
@@ -863,7 +863,7 @@ class WorkflowRun(TaskContinuation):
             "defaults to every vector/raster task input with vectors above rasters"
         ),
     )
-    title: str | None = Field(None, description="Map title; defaults to the task goal")
+    title: str | None = Field(None, description="Map title; omit for a concise title derived from the task goal")
     legend_title: str | None = Field(None, description="Optional reader-facing legend heading")
     map_language: Literal["auto", "zh", "en"] = "auto"
     show_legend_title: bool = True

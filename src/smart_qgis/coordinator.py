@@ -141,6 +141,11 @@ class TaskCoordinator:
             )
         return self.store
 
+    @staticmethod
+    def default_map_title(goal):
+        """Use a concise first sentence when no reader-facing title was supplied."""
+        return re.split(r"(?<=[.!?。！？])\s+", goal.strip(), maxsplit=1)[0] or goal
+
     def issue_continuation(self, purpose="continue", step_id=None, *, state_version=None):
         store = self.require_task()
         task = store.task()
@@ -1980,7 +1985,7 @@ class TaskCoordinator:
                 "operation": "layout",
                 "arguments": {
                     "action": "create", "name": layout_id,
-                    "title": presentation["title"] or task["goal"],
+                    "title": presentation["title"] or self.default_map_title(task["goal"]),
                     "legend_title": presentation.get("legend_title"),
                     "map_language": presentation.get("map_language", "auto"),
                     "show_legend_title": presentation.get("show_legend_title", True),
@@ -3247,7 +3252,7 @@ class TaskCoordinator:
                 "arguments": {
                     "action": "create",
                     "name": a["output"],
-                    "title": a.get("title") or store.task()["goal"],
+                    "title": a.get("title") or self.default_map_title(store.task()["goal"]),
                     "legend_title": a.get("legend_title"),
                     "map_language": a.get("map_language", "auto"),
                     "show_legend_title": a.get("show_legend_title", True),

@@ -7,11 +7,19 @@ import pytest
 from pydantic import ValidationError
 
 from smart_qgis import server as mcp_server
-from smart_qgis.contracts import TaskContract, verifier_catalog
+from smart_qgis.contracts import CoordinateAnnotations, TaskContract, verifier_catalog
 from smart_qgis.coordinator import TaskCoordinator
 from smart_qgis.task_store import TaskError
 from smart_qgis.task_tools import ContractHelp, StepContractSubmit, TaskContractSubmit
 from smart_qgis.tools import build_tools
+
+
+def test_coordinate_annotation_density_presets_default_to_moderate():
+    assert CoordinateAnnotations().density == "moderate"
+    assert CoordinateAnnotations(density="sparse").density == "sparse"
+    assert CoordinateAnnotations(density="dense").density == "dense"
+    with pytest.raises(ValidationError):
+        CoordinateAnnotations(density="auto")
 
 
 def test_reliable_tool_surface_hides_direct_mutations(tmp_path):

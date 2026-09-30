@@ -434,6 +434,18 @@ def layout_content(layout, check):
         if anchor is None:
             return True
         center_x, center_y = x + width / 2, y + height / 2
+        tolerance = 1.0
+        if frame == "outside":
+            if anchor == "left":
+                return x + width <= map_x + tolerance
+            if anchor == "right":
+                return x >= map_right - tolerance
+            if anchor.endswith("left") and abs(x - map_x) > tolerance:
+                return False
+            if anchor.endswith("right") and abs(x + width - map_right) > tolerance:
+                return False
+            if anchor in {"top", "bottom"} and abs(center_x - (map_x + map_width / 2)) > tolerance:
+                return False
         if anchor.startswith("top") and not (y + height <= map_y if frame == "outside" else center_y <= map_y + map_height / 3):
             return False
         if anchor.startswith("bottom") and not (y >= map_bottom if frame == "outside" else center_y >= map_y + map_height * 2 / 3):

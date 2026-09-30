@@ -169,6 +169,13 @@ def test_only_unambiguous_output_overwrite_instructions_are_authorized(instructi
     assert explicitly_authorizes_output_overwrite(instruction) is authorized
 
 
+def test_default_map_title_uses_first_sentence():
+    assert TaskCoordinator.default_map_title(
+        "Compute terrain ruggedness from a DEM. Then export the result map."
+    ) == "Compute terrain ruggedness from a DEM."
+    assert TaskCoordinator.default_map_title("基于 DEM 的崎岖度结果图") == "基于 DEM 的崎岖度结果图"
+
+
 def test_undeclared_output_destination_uses_the_ephemeral_execution_directory(tmp_path):
     store = TaskStore.create(
         tmp_path / "state", "Output", {},

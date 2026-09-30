@@ -40,10 +40,12 @@ from qgis.core import (  # noqa: E402
     QgsFeatureRequest,
     QgsFillSymbol,
     QgsLayoutExporter,
+    QgsLayoutItem,
     QgsLayoutItemLabel,
     QgsLayoutItemLegend,
     QgsLayoutItemMap,
     QgsLayoutItemMapGrid,
+    QgsLayoutItemPage,
     QgsLayoutItemPicture,
     QgsLayoutItemScaleBar,
     QgsLayoutPoint,
@@ -1056,7 +1058,7 @@ class Engine:
         )
         return QgsCoordinateTransform(layer.crs(), target, self.project).transformBoundingBox(extent)
 
-    def layout(self, a):
+    def layout(self, a, _margin_overrides=None, _layout_pass=0, _effective_dimension_coverage=None):
         manager = self.project.layoutManager()
         action = a.get("action", "create")
         name = a.get("name", "Map")
@@ -1141,24 +1143,22 @@ class Engine:
                     if image.pixelColor(x, y).alpha() > 8
                 )
                 scores[anchor] = painted / max(1, (x1 - x0) * (y1 - y0))
-            # A corner must be mostly transparent, not just lighter than its
-            # neighbors. Preference order keeps legend and scale conventions.
+            # A corner must be genuinely empty, not just dark/light terrain or
+            # a thin transparent halo introduced by extent padding.  A legend
+            # or scale bar can only use it when it will not cover data.
             preference = {name: index for index, name in enumerate(
                 ("top_right", "bottom_right", "bottom_left", "top_left")
             )}
             return sorted(
-                (anchor for anchor, score in scores.items() if score <= 0.50),
+                (anchor for anchor, score in scores.items() if score <= 0.08),
                 key=lambda anchor: (scores[anchor], preference[anchor]),
             )
 
         def legend_item_count():
-            count = 0
-            for layer_item in thematic_layers:
-                try:
-                    count += max(1, len(layer_item.legendSymbologyItems()))
-                except Exception:
-                    count += 1
-            return max(1, count)
+            # Auto-layout reacts to reader-facing layers, not renderer breaks:
+            # one visible thematic raster/point/line/polygon layer is one
+            # legend item. Basemaps were excluded when thematic_layers formed.
+            return max(1, len(thematic_layers))
 
         blank_anchors = usable_inside_anchors()
         automatic_inside_space = len(blank_anchors) >= 2
@@ -1207,6 +1207,20 @@ class Engine:
             }
 
         placements = {name: placement(name) for name in defaults}
+        automatic_bottom_row = (
+            not requested_elements.get("legend")
+            and not requested_elements.get("scalebar")
+            and placements["legend"] == {"frame": "outside", "anchor": "bottom_left"}
+            and placements["scalebar"] == {"frame": "outside", "anchor": "bottom_right"}
+            and automatic_legend_items <= 3
+        )
+        automatic_right_column = (
+            not requested_elements.get("legend")
+            and not requested_elements.get("scalebar")
+            and placements["legend"] == {"frame": "outside", "anchor": "top_right"}
+            and placements["scalebar"] == {"frame": "outside", "anchor": "bottom_right"}
+            and automatic_legend_items > 3
+        )
         resolved_legend_flow = None
         resolved_scalebar = None
         resolved_annotations = None
@@ -1222,57 +1236,84 @@ class Engine:
         ]
         outside_bottom = any(placements[name]["anchor"].startswith("bottom") for name in outside_names)
         outside_top = any(placements[name]["anchor"].startswith("top") for name in outside_names)
-        outside_left = any(placements[name]["anchor"].endswith("left") or placements[name]["anchor"] == "left"
-                           for name in outside_names)
-        outside_right = any(placements[name]["anchor"].endswith("right") or placements[name]["anchor"] == "right"
-                            for name in outside_names)
+        # Top/bottom corner items occupy their respective header/footer band,
+        # not a full side column. Only a true side item, or the automatic long
+        # legend column, reserves horizontal map-frame space.
+        outside_left = any(placements[name]["anchor"] == "left" for name in outside_names)
+        outside_right = automatic_right_column or any(
+            placements[name]["anchor"] == "right" for name in outside_names
+        )
         # A fixed A4 page makes near-square thematic layers look like small
         # thumbnails when a title or outside elements reserve a narrow band.
         # Size an automatic page around the real data ratio instead. The map
         # keeps its geographic aspect and full extent; only unused paper moves.
         extent_ratio = extent.width() / extent.height()
         orientation = a.get("page_orientation", "auto")
-        requested_orientation = orientation
         if orientation == "auto":
             orientation = "landscape" if extent_ratio >= 1.15 else "portrait"
-        left_margin = 12 + (58 if outside_left else 0)
-        right_margin = 12 + (64 if outside_right else 0)
-        top_margin = 28 + (24 if outside_top and placements["title"]["anchor"] != "top" else 0)
-        # A footer is a placement band, not a fixed 45 mm page reservation.
-        bottom_margin = 12 + (32 if outside_bottom else 0)
+        # Use a compact, fixed-scale canvas instead of letting margins grow a
+        # page into a poster.  A map may have any geographic aspect ratio, so
+        # only its long edge adapts; the short map edge has a stable physical
+        # scale.  This makes a reader-facing font consistently legible in
+        # exported PNGs of wide, normal and tall maps.
+        page_edge_safety = 12
+        coordinate_side_allowance = 24
+        base_left_margin = page_edge_safety + coordinate_side_allowance + (44 if outside_left else 0)
+        # The right-side variant must contain the enlarged 36 pt scale-bar
+        # labels as well as its bar, not only the legend column.
+        base_right_margin = page_edge_safety + coordinate_side_allowance + (132 if outside_right else 0)
+        # The title is centred above the frame.  The compact header/footer
+        # retain a clear gap to both the page edge and the coordinate labels.
+        base_top_margin = page_edge_safety + (50 if outside_top else 28)
+        coordinate_bottom_clearance = 10
+        bottom_legend = (
+            enabled_elements["legend"]
+            and placements["legend"]["frame"] == "outside"
+            and placements["legend"]["anchor"].startswith("bottom")
+        )
+        base_bottom_margin = 70 if bottom_legend else (48 if outside_bottom else 28)
+        # Margins are initially compact.  Actual QGIS item bounds are checked
+        # below and, if necessary, these values are enlarged before export.
+        # This matters for large-font raster legends whose true rendered
+        # height is not known until QGIS builds the legend model.
+        margin_overrides = _margin_overrides or {}
+        left_margin = max(base_left_margin, float(margin_overrides.get("left", 0)))
+        right_margin = max(base_right_margin, float(margin_overrides.get("right", 0)))
+        top_margin = max(base_top_margin, float(margin_overrides.get("top", 0)))
+        bottom_margin = max(base_bottom_margin, float(margin_overrides.get("bottom", 0)))
         map_frame = a.get("map_frame") or {}
         frame_mode = map_frame.get("mode", "auto")
         if frame_mode not in {"auto", "maximize"}:
             raise ValueError("map_frame.mode must be auto or maximize")
-        if requested_orientation == "auto":
-            if orientation == "landscape":
-                width = 297
-                map_width = width - left_margin - right_margin
-                map_height = map_width / extent_ratio
-                height = top_margin + bottom_margin + map_height
-                # A nearly square wide layer needs a compact near-square page,
-                # rather than a small thumbnail in fixed A4 landscape.
-                if height > 297:
-                    orientation = "portrait"
-                    height = 297
-                    map_height = height - top_margin - bottom_margin
-                    map_width = map_height * extent_ratio
-                    width = map_width + left_margin + right_margin
-            else:
-                # Unlike a fixed A4 portrait page, a compact portrait page
-                # keeps a square or tall thematic frame dominant instead of
-                # leaving a long, unused lower strip.
-                map_height = 240
-                map_width = map_height * extent_ratio
-                width = map_width + left_margin + right_margin
-                height = top_margin + bottom_margin + map_height
-        elif orientation == "landscape":
-            width, height = 297, 210
-            map_width, map_height = None, None
+        requested_dimension_coverage = float(map_frame.get("min_page_dimension_coverage", 0.80))
+        if not 0.80 <= requested_dimension_coverage <= 0.95:
+            raise ValueError("map_frame.min_page_dimension_coverage must be between 0.80 and 0.95")
+        min_dimension_coverage = (
+            requested_dimension_coverage
+            if _effective_dimension_coverage is None
+            else _effective_dimension_coverage
+        )
+        minimum_map_width = (left_margin + right_margin) * min_dimension_coverage / (1 - min_dimension_coverage)
+        minimum_map_height = (top_margin + bottom_margin) * min_dimension_coverage / (1 - min_dimension_coverage)
+        # A 500 mm short page edge is our stable canvas scale.  The requested
+        # orientation chooses which map edge is held at the requested fraction of that canvas;
+        # the other edge follows data aspect.  Extreme aspect ratios may grow
+        # only as much as necessary to honour the frame-coverage rule.
+        fixed_short_page_edge = 500
+        fixed_short_map_edge = fixed_short_page_edge * min_dimension_coverage
+        if orientation == "landscape":
+            map_height = max(
+                fixed_short_map_edge, minimum_map_height, minimum_map_width / extent_ratio
+            )
+            map_width = map_height * extent_ratio
         else:
-            width, height = 210, 297
-            map_width, map_height = None, None
-        if width < 100 or height < 100 or width > 1000 or height > 1000:
+            map_width = max(
+                fixed_short_map_edge, minimum_map_width, minimum_map_height * extent_ratio
+            )
+            map_height = map_width / extent_ratio
+        width = left_margin + map_width + right_margin
+        height = top_margin + map_height + bottom_margin
+        if width < 100 or height < 100 or width > 1600 or height > 1600:
             raise ValueError("Automatic page size is outside supported layout bounds")
         layout.pageCollection().pages()[0].setPageSize(QgsLayoutSize(width, height))
         layout.renderContext().setDpi(150)
@@ -1287,6 +1328,13 @@ class Engine:
             map_width, map_height = frame_width, frame_width * extent.height() / extent.width()
         else:
             map_width, map_height = frame_height * extent.width() / extent.height(), frame_height
+        width_coverage = map_width / width
+        height_coverage = map_height / height
+        if width_coverage + 1e-9 < min_dimension_coverage or height_coverage + 1e-9 < min_dimension_coverage:
+            raise ValueError(
+                "Requested page orientation and outside map elements cannot keep the main map frame "
+                f"at {min_dimension_coverage:.0%} of both page dimensions; use automatic orientation or move elements"
+            )
         map_x = left_margin + (frame_width - map_width) / 2
         map_y = top_margin + (frame_height - map_height) / 2
         map_item = QgsLayoutItemMap(layout)
@@ -1302,20 +1350,44 @@ class Engine:
         map_item.setCustomProperty(
             "smart-qgis:page-coverage", round((map_width * map_height) / (width * height), 4)
         )
+        map_item.setCustomProperty("smart-qgis:width-coverage", round(width_coverage, 4))
+        map_item.setCustomProperty("smart-qgis:height-coverage", round(height_coverage, 4))
+
+        # Keep a modest but visible breathing room between the map frame,
+        # surrounding page and every element anchored inside or outside it.
+        inside_inset, outside_gap = 8, 12
+        # The former page-scaled value was physically large but visually tiny
+        # because its canvas expanded with it.  On the fixed-scale canvas use
+        # a deliberately large reader-facing base: about twice the previous
+        # rendered appearance, not merely twice a QGIS default of 8--12 pt.
+        auxiliary_text_size = 42
+
+        def text_format(size):
+            fmt = QgsTextFormat()
+            fmt.setFont(QFont("Arial", size))
+            fmt.setSize(size)
+            return fmt
 
         def position_for(name, item_width, item_height):
             choice = placements[name]
             anchor = choice["anchor"]
             inside = choice["frame"] == "inside"
             if inside:
-                x_left, x_right = map_x + 4, map_x + map_width - item_width - 4
-                y_top, y_bottom = map_y + 4, map_y + map_height - item_height - 4
+                x_left, x_right = map_x + inside_inset, map_x + map_width - item_width - inside_inset
+                y_top, y_bottom = map_y + inside_inset, map_y + map_height - item_height - inside_inset
                 x_center, y_center = map_x + (map_width - item_width) / 2, map_y + (map_height - item_height) / 2
             else:
-                x_left, x_right = 12, width - item_width - 12
-                y_top = 8 if name == "title" or anchor == "top" else map_y
-                y_bottom = map_y + map_height + 8
-                x_center, y_center = (width - item_width) / 2, map_y + (map_height - item_height) / 2
+                # Outside corners are adjacent to and aligned with the map
+                # frame—not the page corners.  This keeps elements visually
+                # attached to their map when an automatic page has spare room.
+                if anchor == "left":
+                    return map_x - item_width - outside_gap, map_y + (map_height - item_height) / 2
+                if anchor == "right":
+                    return map_x + map_width + outside_gap, map_y + (map_height - item_height) / 2
+                x_left, x_right = map_x, map_x + map_width - item_width
+                y_top = map_y - item_height - outside_gap
+                y_bottom = map_y + map_height + outside_gap + coordinate_bottom_clearance
+                x_center, y_center = map_x + (map_width - item_width) / 2, map_y + (map_height - item_height) / 2
             x = x_left if anchor.endswith("left") or anchor == "left" else (
                 x_right if anchor.endswith("right") or anchor == "right" else x_center
             )
@@ -1336,23 +1408,17 @@ class Engine:
         def label(text, x, y, w, h, size):
             item = QgsLayoutItemLabel(layout)
             item.setText(text)
-            fmt = QgsTextFormat()
-            fmt.setFont(QFont("Arial", size))
-            fmt.setSize(size)
-            item.setTextFormat(fmt)
+            item.setTextFormat(text_format(size))
             layout.addLayoutItem(item)
             item.attemptMove(QgsLayoutPoint(x, y))
             item.attemptResize(QgsLayoutSize(w, h))
             return item
 
         if a.get("show_title", True):
-            title_width = (
-                max(20, map_width - 8)
-                if placements["title"]["frame"] == "inside"
-                else width - 24
-            )
-            title_item = label(a.get("title") or name, 12, 8, title_width, 15,
-                               min(18, max(11, round(width / 12))))
+            title_width = max(20, map_width - 8)
+            title_size = 58
+            title_height = max(15, title_size * .65)
+            title_item = label(a.get("title") or name, 12, 8, title_width, title_height, title_size)
             title_item.setId("map-title")
             title_anchor = placements["title"]["anchor"]
             title_item.setHAlign(
@@ -1362,7 +1428,7 @@ class Engine:
                 if title_anchor.endswith("right") or title_anchor == "right"
                 else Qt.AlignmentFlag.AlignHCenter
             )
-            place(title_item, "title", min(title_width, 90), 15)
+            place(title_item, "title", min(title_width, 90), title_height)
         if a.get("grid", True):
             grid_reference = crs(a.get("grid_crs") or "EPSG:4326")
             annotation_options = a.get("coordinate_annotations") or {}
@@ -1378,14 +1444,37 @@ class Engine:
             grid_extent = QgsCoordinateTransform(
                 target, grid_reference, self.project
             ).transformBoundingBox(map_item.extent())
-            density_divisor = {
-                "auto": 5, "dense": 8, "sparse": 3,
-            }[annotation_options.get("density", "auto")]
-            span = max(grid_extent.width(), grid_extent.height()) / density_divisor
-            power = 10 ** math.floor(math.log10(span))
-            interval = next((n * power for n in (1, 2, 5, 10) if n * power >= span), 10 * power)
-            grid.setIntervalX(interval)
-            grid.setIntervalY(interval)
+            # Resolve density from the number of visible coordinate labels,
+            # not an arbitrary degree/metre interval. Each axis is separate:
+            # the shorter axis must not silently become sparse.
+            minimum_labels = {
+                "sparse": 2, "moderate": 4, "dense": 6,
+            }[annotation_options.get("density", "moderate")]
+
+            def nice_interval(axis_minimum, axis_maximum):
+                axis_span = axis_maximum - axis_minimum
+                power = math.floor(math.log10(axis_span))
+                candidates = sorted({
+                    multiplier * 10 ** exponent
+                    for exponent in range(power - 12, power + 4)
+                    for multiplier in (1, 2, 5)
+                })
+
+                def label_count(interval):
+                    epsilon = max(1, abs(axis_minimum), abs(axis_maximum)) * 1e-10
+                    return max(0, int(
+                        math.floor((axis_maximum + epsilon) / interval)
+                        - math.ceil((axis_minimum - epsilon) / interval) + 1
+                    ))
+
+                viable = [candidate for candidate in candidates if label_count(candidate) >= minimum_labels]
+                interval = max(viable)
+                return interval, label_count(interval)
+
+            interval_x, labels_x = nice_interval(grid_extent.xMinimum(), grid_extent.xMaximum())
+            interval_y, labels_y = nice_interval(grid_extent.yMinimum(), grid_extent.yMaximum())
+            grid.setIntervalX(interval_x)
+            grid.setIntervalY(interval_y)
             grid.setStyle(
                 QgsLayoutItemMapGrid.Solid
                 if annotation_options.get("grid_lines", False)
@@ -1408,10 +1497,7 @@ class Engine:
             grid.setAnnotationFormat(annotation_formats[(annotation_format, show_suffixes)])
             precision = annotation_options.get("precision")
             grid.setAnnotationPrecision(1 if precision is None else precision)
-            grid_format = QgsTextFormat()
-            grid_format.setFont(QFont("Arial", 8))
-            grid_format.setSize(8)
-            grid.setAnnotationTextFormat(grid_format)
+            grid.setAnnotationTextFormat(text_format(auxiliary_text_size))
             sides = set(annotation_options.get("sides") or
                         ("top", "bottom", "left", "right"))
             for side_name, side, display in (
@@ -1426,10 +1512,13 @@ class Engine:
                 "format": annotation_format,
                 "precision": 1 if precision is None else precision,
                 "cardinal_directions": show_suffixes,
-                "density": annotation_options.get("density", "auto"),
-                "interval": interval,
+                "density": annotation_options.get("density", "moderate"),
+                "interval": {"x": interval_x, "y": interval_y},
+                "minimum_labels_per_axis": minimum_labels,
+                "estimated_label_count": {"x": labels_x, "y": labels_y},
                 "grid_lines": annotation_options.get("grid_lines", False),
                 "sides": sorted(sides),
+                "font_size_pt": auxiliary_text_size,
             }
         if a.get("legend", True):
             legend = QgsLayoutItemLegend(layout)
@@ -1441,9 +1530,14 @@ class Engine:
                 map_language == "auto" and bool(re.search(r"[\u4e00-\u9fff]", map_title))
             )
             if a.get("show_legend_title", True):
+                # A one-layer legend already displays the reader-facing layer
+                # name.  Adding a generic “Legend/图例” title duplicates a
+                # line, consumes the compact footer and makes the type look
+                # smaller.  Keep an explicit heading, or add a generic title
+                # only when several thematic layers need a shared heading.
                 legend.setTitle(
                     a.get("legend_title")
-                    or ("图例" if use_chinese else "Legend")
+                    or ("" if len(thematic_layers) == 1 else ("图例" if use_chinese else "Legend"))
                 )
             else:
                 legend.setTitle("")
@@ -1458,10 +1552,34 @@ class Engine:
                 if layer.providerType() != "wms":
                     node = root.addLayer(layer)
                     legend_nodes = legend.model().layerLegendNodes(node)
-                    if (len(legend_nodes) == 2
-                            and re.fullmatch(r"Band \d+(?: \([^)]*\))?", str(legend_nodes[0].data(0)))):
-                        QgsMapLayerLegendUtils.setLegendNodeUserLabel(node, 0, " ")
-                        legend.model().refreshLayerLegend(node)
+                # Generic raw-band labels describe source encoding, not a
+                # cartographic theme. Remove just those entries while keeping
+                # meaningful color-ramp/category nodes (whose labels may be
+                # null because QGIS renders their numeric range itself).
+                meaningful_nodes = [
+                    index for index, item in enumerate(legend_nodes)
+                    if not re.fullmatch(r"Band \d+(?: \([^)]*\))?", str(item.data(0)))
+                ]
+                if len(meaningful_nodes) != len(legend_nodes):
+                    QgsMapLayerLegendUtils.setLegendNodeOrder(node, meaningful_nodes)
+                    legend.model().refreshLayerLegend(node)
+            # QGIS renders a legend title, group/layer name and symbol label
+            # through separate style components. A legend needs a little more
+            # emphasis than coordinates after a large exported page is scaled
+            # down to an ordinary screen, so use a larger derived size.
+            legend_text_size = 48
+            for component, size in (
+                (Qgis.LegendComponent.Title, 54),
+                (Qgis.LegendComponent.Group, legend_text_size),
+                (Qgis.LegendComponent.Subgroup, legend_text_size),
+                (Qgis.LegendComponent.SymbolLabel, legend_text_size),
+            ):
+                # ``style()`` returns a SIP value copy. Mutating that copy
+                # alone silently leaves QGIS's default 9 pt legend in place;
+                # write the modified style back through ``setStyle``.
+                style = legend.style(component)
+                style.setTextFormat(text_format(size))
+                legend.setStyle(component, style)
             legend_flow = (requested_elements.get("legend") or {}).get("flow", "auto")
             if legend_flow == "horizontal" or (
                 legend_flow == "auto"
@@ -1471,9 +1589,21 @@ class Engine:
                 legend.setColumnCount(automatic_legend_items)
             elif legend_flow == "vertical":
                 legend.setColumnCount(1)
-            resolved_legend_flow = legend_flow
+            resolved_legend_flow = (
+                "horizontal" if legend_flow == "horizontal" or automatic_bottom_row else "vertical"
+            )
             layout.addLayoutItem(legend)
             legend.adjustBoxSize()
+            # A raw multiband raster may intentionally have no reader-facing
+            # legend nodes after generic Band labels are removed. QGIS then
+            # reports a zero-sized item even though it still paints the layer
+            # name. Give every legend a real minimum envelope so anchoring,
+            # background and collision checks describe what readers see.
+            natural_size = legend.sizeWithUnits()
+            legend.attemptResize(QgsLayoutSize(
+                max(55, natural_size.width()),
+                max(28, natural_size.height(), 8 + len(layers) * (auxiliary_text_size * .45 + 3)),
+            ))
             legend.setId("map-legend")
             place(legend, "legend", 55, 28)
             legend.setBackgroundEnabled(True)
@@ -1491,6 +1621,12 @@ class Engine:
             scale.setStyle(scale_styles[scale_options.get("style", "single_box")])
             scale.setLinkedMap(map_item)
             scale.applyDefaultSize()
+            # Coordinate annotations and legend need the largest reading
+            # size. A scale bar has three adjacent numeric labels, so cap it
+            # at a still-clear companion size to keep a right-side column
+            # inside the page instead of forcing an impractically wide map.
+            scalebar_text_size = 36
+            scale.setTextFormat(text_format(scalebar_text_size))
             map_extent = map_item.extent()
             if target.isGeographic():
                 width_km = (map_extent.width() * 111.32
@@ -1513,14 +1649,45 @@ class Engine:
             scale.setUnitLabel(unit_label)
             scale.setNumberOfSegments(2)
             scale.setNumberOfSegmentsLeft(0)
+            # Let QGIS choose a round map-unit segment length that fits a
+            # bounded paper width. This avoids either a tiny bar or a fixed
+            # unit length that pushes its labels beyond the page.
+            scale.setSegmentSizeMode(Qgis.ScaleBarSegmentSizeMode.FitWidth)
+            scale.setMinimumBarWidth(max(45, scalebar_text_size * 2.1 + 8))
+            scale.setMaximumBarWidth(max(60, scalebar_text_size * 2.8 + 10))
             resolved_scalebar = {
                 "units": requested_units,
                 "style": scale_options.get("style", "single_box"),
             }
             layout.addLayoutItem(scale)
             scale.refresh()
+            scale.resizeToMinimumWidth()
             scale.setId("map-scalebar")
-            place(scale, "scalebar", 42, 8)
+            place(scale, "scalebar", 52, 10)
+            # Keep server-resolved external elements attached to their map,
+            # never to page corners.  A short legend uses the map-frame left
+            # and the scale bar the map-frame right on one bottom row; a long
+            # legend and scale bar share the left edge of the reserved right
+            # column. Explicit placements remain untouched.
+            if a.get("legend", True):
+                legend_size = legend.sizeWithUnits()
+                scale_size = scale.sizeWithUnits()
+                legend_height = max(28, legend_size.height())
+                scale_width, scale_height = max(52, scale_size.width()), max(10, scale_size.height())
+                if automatic_bottom_row:
+                    row_y = map_y + map_height + outside_gap + coordinate_bottom_clearance
+                    legend.attemptMove(QgsLayoutPoint(map_x, row_y))
+                    scale.attemptMove(QgsLayoutPoint(
+                        map_x + map_width - scale_width,
+                        row_y + (legend_height - scale_height) / 2,
+                    ))
+                elif automatic_right_column:
+                    column_x = map_x + map_width + outside_gap
+                    legend.attemptMove(QgsLayoutPoint(column_x, map_y + outside_gap))
+                    scale.attemptMove(QgsLayoutPoint(
+                        column_x,
+                        map_y + map_height - scale_height - outside_gap,
+                    ))
         if a.get("north_arrow", False):
             arrow_path = next((
                 str(path) for root in QgsApplication.svgPaths()
@@ -1542,7 +1709,67 @@ class Engine:
             )
         )
         if attribution:
-            label(attribution, 12, height - 10, width - 24, 7, 7)
+            # Keep attribution inside the same page-edge safety envelope used
+            # for all checked layout items. Its previous y=h-10 position
+            # always crossed the bottom safety edge and could trigger an
+            # unnecessary re-layout loop.
+            label(attribution, 12, height - page_edge_safety - 7, width - 24, 7, 7)
+
+        # Verify the *actual* QGIS item envelopes, rather than trusting the
+        # nominal footer/header sizes used while sizing the page.  In
+        # particular, a colour-ramp legend can be taller than its initial
+        # estimate once QGIS has populated all labels.  Rebuild with larger
+        # margins before registering/exporting the layout, so no visible map
+        # element is silently cropped by the page.
+        safe_items = [
+            item for item in layout.items()
+            if isinstance(item, QgsLayoutItem)
+            and not isinstance(item, QgsLayoutItemPage)
+            and item.isVisible()
+            and not item.excludeFromExports()
+        ]
+        bounds = [
+            (
+                item.positionWithUnits().x(),
+                item.positionWithUnits().y(),
+                item.positionWithUnits().x() + item.sizeWithUnits().width(),
+                item.positionWithUnits().y() + item.sizeWithUnits().height(),
+            )
+            for item in safe_items
+        ]
+        overflow = {
+            "left": max(0.0, page_edge_safety - min((left for left, _, _, _ in bounds), default=page_edge_safety)),
+            "top": max(0.0, page_edge_safety - min((top for _, top, _, _ in bounds), default=page_edge_safety)),
+            "right": max(0.0, max((right for _, _, right, _ in bounds), default=width) - (width - page_edge_safety)),
+            "bottom": max(0.0, max((bottom for _, _, _, bottom in bounds), default=height) - (height - page_edge_safety)),
+        }
+        if any(value > 0.01 for value in overflow.values()):
+            if _layout_pass >= 2:
+                raise ValueError(
+                    "Map layout cannot fit all visible elements inside the page; "
+                    "change map-element positions, reduce legend content, or use a larger page"
+                )
+            next_margins = {
+                "left": left_margin + overflow["left"],
+                "top": top_margin + overflow["top"],
+                "right": right_margin + overflow["right"],
+                "bottom": bottom_margin + overflow["bottom"],
+            }
+            # Coverage is a preferred composition target, not a reason to
+            # crop a legend.  Preserve the stable 400 mm reference map edge
+            # when possible and reduce the effective target only enough to
+            # fit the measured margin requirements.
+            preferred_map_edge = fixed_short_page_edge * 0.80
+            fitted_coverage = min(
+                preferred_map_edge / (preferred_map_edge + next_margins["left"] + next_margins["right"]),
+                preferred_map_edge / (preferred_map_edge + next_margins["top"] + next_margins["bottom"]),
+            )
+            return self.layout(
+                a,
+                _margin_overrides=next_margins,
+                _layout_pass=_layout_pass + 1,
+                _effective_dimension_coverage=max(0.20, min(min_dimension_coverage, fitted_coverage)),
+            )
         if existing:
             manager.removeLayout(existing)
         manager.addLayout(layout)
@@ -1555,6 +1782,8 @@ class Engine:
             "page_orientation": orientation,
             "map_frame_mode": frame_mode,
             "map_frame_page_coverage": map_item.customProperty("smart-qgis:page-coverage"),
+            "map_frame_width_coverage": map_item.customProperty("smart-qgis:width-coverage"),
+            "map_frame_height_coverage": map_item.customProperty("smart-qgis:height-coverage"),
             "resolved_element_placements": {
                 name: placements[name] for name, enabled in enabled_elements.items() if enabled
             },
@@ -1569,6 +1798,7 @@ class Engine:
             ) if a.get("legend", True) else None,
             "scalebar": resolved_scalebar,
             "coordinate_annotations": resolved_annotations,
+            "layout_item_bounds_verified": True,
         }
 
     def export_map(self, a):

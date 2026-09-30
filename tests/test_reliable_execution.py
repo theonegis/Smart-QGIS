@@ -1187,12 +1187,53 @@ async def test_single_frame_map_common_projection_and_element_options(tmp_path):
         assert result["legend_flow"] == "vertical"
         assert result["legend_border"] is True
         assert result["scalebar"] == {"units": "miles", "style": "double_box"}
-        assert result["coordinate_annotations"] == {
+        annotations = result["coordinate_annotations"]
+        assert {
+            key: value for key, value in annotations.items()
+            if key not in {"font_size_pt", "minimum_labels_per_axis", "estimated_label_count"}
+        } == {
             "crs": "EPSG:4326", "format": "degree_minute_second",
             "precision": 1, "cardinal_directions": True, "density": "sparse",
-            "interval": result["coordinate_annotations"]["interval"],
+            "interval": annotations["interval"],
             "grid_lines": True, "sides": ["bottom", "left"],
         }
+        assert annotations["font_size_pt"] >= 42
+        assert annotations["minimum_labels_per_axis"] == 2
+        assert min(annotations["estimated_label_count"].values()) >= 2
+    finally:
+        await bridge.close()
+
+
+async def test_coordinate_density_uses_independent_readable_axis_intervals(tmp_path):
+    require_qgis()
+    source = tmp_path / "density.geojson"
+    source.write_text(json.dumps({
+        "type": "FeatureCollection",
+        "features": [
+            {"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [100, 30]}},
+            {"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [101, 30.65]}},
+        ],
+    }))
+    bridge = QgisBridge(120)
+    try:
+        layer = await bridge.call("load_data", {"path": str(source), "kind": "vector"})
+
+        async def annotation_for(density=None):
+            arguments = {
+                "name": f"density-{density or 'default'}", "layers": [layer["id"]],
+                "extent_layer": layer["id"],
+            }
+            if density:
+                arguments["coordinate_annotations"] = {"density": density}
+            return (await bridge.call("layout", arguments))["coordinate_annotations"]
+
+        sparse = await annotation_for("sparse")
+        moderate = await annotation_for()
+        dense = await annotation_for("dense")
+        assert moderate["density"] == "moderate"
+        assert [item["minimum_labels_per_axis"] for item in (sparse, moderate, dense)] == [2, 4, 6]
+        for annotation in (sparse, moderate, dense):
+            assert min(annotation["estimated_label_count"].values()) >= annotation["minimum_labels_per_axis"]
     finally:
         await bridge.close()
 

@@ -152,7 +152,7 @@ class Processing(Arguments):
 class Layout(Arguments):
     action: Literal["create", "list", "remove", "template"] = "create"
     name: str = "Map"
-    title: str = ""
+    title: str = Field("", description="Reader-facing map title; direct-layout callers should supply a concise title")
     show_title: bool = True
     layers: list[str] | None = Field(None, description="Topmost first. Defaults to visible layers.")
     extent_layer: str | None = Field(
