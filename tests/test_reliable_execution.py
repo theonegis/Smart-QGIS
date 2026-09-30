@@ -93,7 +93,7 @@ async def step(
     )
     execute_request = status["next_call"]["arguments"]
     request = execute_request
-    result = await tools["task_execute"].ainvoke(execute_request)
+    result = await tools["step_execute"].ainvoke(execute_request)
     status = await tools["task_diagnose"].ainvoke({"task_id": status["task_id"]})
     return status, result, request
 
@@ -140,6 +140,22 @@ async def test_processing_discovery_filters_pages_and_reports_reliable_support(t
         })
         assert {a['id'] for a in first['algorithms']}.isdisjoint(a['id'] for a in second['algorithms'])
         assert all(a['provider'] == 'native' for a in first['algorithms'] + second['algorithms'])
+        ranked = await coordinator.call('algorithms', {
+            'action': 'list', 'query': 'native:buffer',
+        })
+        assert ranked['algorithms'][0]['id'] == 'native:buffer'
+        assert len(ranked['algorithms']) <= 12
+        assert await coordinator.call('algorithms', {
+            'action': 'list', 'query': 'native:buffer',
+        }) == ranked
+        typo = await coordinator.call('algorithms', {
+            'action': 'list', 'query': 'bufffer', 'provider': 'native',
+        })
+        assert typo['total'] == 0 and typo['algorithms'] == []
+        assert 'native:buffer' in {item['id'] for item in typo['suggestions']}
+        assert all(item['reliable_supported'] for item in typo['suggestions'])
+        assert 'bufffer' in typo['suggested_terms']
+        assert 'do not execute' in typo['next_action']
         buffer = await coordinator.call('algorithms', {'action': 'help', 'algorithm': 'native:buffer'})
         assert buffer['reliable_supported'] and buffer['execution_mode'] == 'reliable'
         parameters = {p['name']: p for p in buffer['parameters']}
@@ -229,12 +245,12 @@ async def test_compact_task_start_rejects_contract_before_creating_task(tmp_path
             "user_response": "Use the source projected CRS",
         }
         with pytest.raises(TaskError) as failure:
-            await coordinator.call("task_record_guidance", {
+            await coordinator.call("task_update", {
                 **guidance, "map_coordinate_crs": "not-a-crs",
             })
         assert failure.value.payload["code"] == "INVALID_CRS"
         assert coordinator.presentation_options()["coordinate_crs"] == "EPSG:4326"
-        clarified = await coordinator.call("task_record_guidance", {
+        clarified = await coordinator.call("task_update", {
             **guidance, "map_coordinate_crs": "EPSG:32126",
         })
         assert clarified["task_id"] == started["task_id"]
@@ -283,7 +299,7 @@ async def test_unknown_output_is_rejected_before_step_or_attempt_is_saved(tmp_pa
         assert coordinator.store.task()["state_version"] == before_version + 1
         assert coordinator.store.db.execute("SELECT count(*) FROM attempts").fetchone()[0] == 0
         next_call = accepted['next_call']
-        assert next_call['tool'] == 'task_execute'
+        assert next_call['tool'] == 'step_execute'
         assert next_call['arguments']['continuation_token']
         executed = await tools[next_call['tool']].ainvoke(next_call['arguments'])
         for _ in range(3):
@@ -442,7 +458,7 @@ async def test_contract_gated_map_completion_idempotence_and_server_resume(tmp_p
         assert result["validation"][0]["status"] == "passed"
         assert all(set(report) == {"id", "status"} for report in result["validation"])
         assert Path(result["assets"]["points"]["path"]).is_file()
-        cached = await tools["task_execute"].ainvoke(request)
+        cached = await tools["step_execute"].ainvoke(request)
         assert cached == result
         assert len((await tools["layer_info"].ainvoke({}))["layers"]) == 1
         status, _, _ = await step(
@@ -577,16 +593,16 @@ async def test_default_mcp_exposes_tasks_and_returns_structured_contract_error(t
             advertised = (await session.list_tools()).tools
             schemas = {tool.name: tool.inputSchema for tool in advertised}
             assert set(schemas) == {
-                "algorithm_info", "task_start", "task_execute_next", "task_answer", "task_record_guidance", "task_invalidate", "task_recover", "task_diagnose",
-                "prepare_algorithm",
+                "project_info", "data_info", "algorithm_info", "task_start", "task_execute",
+                "task_answer", "task_update", "task_resume", "task_diagnose", "task_restart",
+                "task_stop", "prepare_algorithm",
             }
             for name in {
-                "task_execute_next", "task_answer", "task_record_guidance",
-                "task_invalidate", "task_recover", "prepare_algorithm",
+                "task_execute", "task_answer", "task_update", "task_resume", "prepare_algorithm",
             }:
                 assert "continuation_token" not in schemas[name].get("properties", {})
                 assert "continuation_token" not in schemas[name].get("required", [])
-            assert schemas["task_execute_next"].get("properties", {}) == {}
+            assert schemas["task_execute"].get("properties", {}) == {}
 
 
 async def test_step_prepare_load_layout_and_save_recipes(tmp_path):
@@ -639,7 +655,7 @@ async def test_step_prepare_load_layout_and_save_recipes(tmp_path):
             })
             assert state["prepared_recipe"] == action
             assert "assets" not in state and "steps" not in state and "attempts" not in state
-            result = await tools["task_execute"].ainvoke(state["next_call"]["arguments"])
+            result = await tools["step_execute"].ainvoke(state["next_call"]["arguments"])
             assert all(set(report) == {"id", "status"} for report in result["validation"])
             state = await tools["task_diagnose"].ainvoke({"task_id": state["task_id"]})
             return result
@@ -846,10 +862,10 @@ async def test_compact_task_run_inspects_routes_and_finishes_standard_map(tmp_pa
         assert "continuation_token" not in routed
         assert routed["inspections"]["boundary"]["kind"] == "vector"
         assert routed["inspections"]["boundary"]["geometry_type"] == "Polygon"
-        assert routed["next_call"]["tool"] == "task_execute_next"
+        assert routed["next_call"]["tool"] == "task_execute"
         assert routed["next_call"]["arguments"] == {}
 
-        final = await tools["task_execute_next"].ainvoke({})
+        final = await tools["task_execute"].ainvoke({})
         assert final["status"] == "COMPLETED"
         assert "continuation_token" not in final
         assert final["workflow"] == "standard_map_project"
@@ -861,11 +877,436 @@ async def test_compact_task_run_inspects_routes_and_finishes_standard_map(tmp_pa
         assert coordinator.store.db.execute(
             "SELECT count(*) FROM attempts WHERE status='COMMITTED'"
         ).fetchone()[0] == 4
-        replay = await tools["task_execute_next"].ainvoke({})
+        replay = await tools["task_execute"].ainvoke({})
         assert replay == final
         assert coordinator.store.db.execute(
             "SELECT count(*) FROM attempts WHERE status='COMMITTED'"
         ).fetchone()[0] == 4
+        revised = await tools["task_update"].ainvoke({
+            "task_id": final["task_id"],
+            "instruction": "Use the supplied Chinese title.",
+            "map_title": "基于 DEM 的崎岖度计算结果制图",
+            "legend_title": "地形崎岖度",
+            "map_crs": "EPSG:3857",
+            "map_coordinate_crs": "EPSG:4326",
+            "map_coordinate_annotations": {
+                "format": "degree_minute", "cardinal_directions": False,
+                "density": "sparse",
+            },
+            "map_elements": {"legend": {"border": True}},
+        })
+        assert revised["presentation_rebuild"] is True
+        assert revised["completion_state"] == "NOT_COMPLETED"
+        assert revised["next_call"] == {"tool": "task_execute", "arguments": {}}
+        assert "workflow_load_boundary" not in revised["invalidated_steps"]
+        rebuilt = await tools["task_execute"].ainvoke({})
+        assert rebuilt["status"] == "COMPLETED"
+        layout_contract = json.loads(coordinator.store.db.execute(
+            "SELECT body FROM steps WHERE id='presentation_layout'"
+        ).fetchone()[0])
+        assert layout_contract["arguments"]["title"] == "基于 DEM 的崎岖度计算结果制图"
+        assert layout_contract["arguments"]["legend_title"] == "地形崎岖度"
+        assert layout_contract["arguments"]["crs"] == "EPSG:3857"
+        assert layout_contract["arguments"]["coordinate_annotations"]["density"] == "sparse"
+        assert layout_contract["arguments"]["map_elements"]["legend"]["border"] is True
+    finally:
+        await coordinator.close()
+
+
+async def test_compact_task_adds_osm_basemap_without_changing_thematic_extent(tmp_path):
+    require_qgis()
+    source = tmp_path / "area.geojson"
+    source.write_text(json.dumps({
+        "type": "FeatureCollection",
+        "features": [{"type": "Feature", "properties": {}, "geometry": {
+            "type": "Polygon", "coordinates": [[[100, 30], [102, 30], [102, 32], [100, 32], [100, 30]]],
+        }}],
+    }))
+    coordinator = TaskCoordinator(QgisBridge(120), tmp_path / "osm-state")
+    try:
+        tools = {tool.name: tool for tool in build_tools(coordinator, compact=True)}
+        await tools["task_start"].ainvoke({
+            "goal": "Create a boundary map with OSM context",
+            "inputs": {"area": {"path": str(source)}},
+            "deliverables": [{"id": "project", "kind": "project", "description": "Editable map"}],
+            "basemap": {"provider": "openstreetmap"},
+            "map_crs": "EPSG:3857",
+            "coordinate_crs": "EPSG:4326",
+            "coordinate_annotations": {
+                "format": "decimal", "cardinal_directions": True, "density": "dense",
+            },
+            "map_elements": {
+                "legend": {"flow": "horizontal", "border": False},
+                "scalebar": {"units": "kilometers", "style": "line_ticks_middle"},
+            },
+        })
+        completed = await tools["task_execute"].ainvoke({})
+        assert completed["status"] == "COMPLETED"
+        assert "add_basemap" in [step["action"] for step in completed["completed_steps"]]
+        layout = next(step for step in completed["completed_steps"] if step["action"] == "create_layout")
+        assert layout["status"] == "COMMITTED"
+        layout_contract = json.loads(coordinator.store.db.execute(
+            "SELECT body FROM steps WHERE id='workflow_layout'"
+        ).fetchone()[0])
+        assert layout_contract["arguments"]["crs"] == "EPSG:3857"
+        assert layout_contract["arguments"]["grid_crs"] == "EPSG:4326"
+        assert layout_contract["arguments"]["coordinate_annotations"]["density"] == "dense"
+    finally:
+        await coordinator.close()
+
+
+async def test_compact_task_can_add_osm_without_a_layout_or_output(tmp_path):
+    require_qgis()
+    coordinator = TaskCoordinator(QgisBridge(120), tmp_path / "osm-only-state")
+    try:
+        tools = {tool.name: tool for tool in build_tools(coordinator, compact=True)}
+        await tools["task_start"].ainvoke({
+            "goal": "Add OpenStreetMap to the current project",
+            "basemap": {"provider": "openstreetmap"},
+        })
+        completed = await tools["task_execute"].ainvoke({})
+        assert completed["status"] == "COMPLETED"
+        assert [step["action"] for step in completed["completed_steps"]] == ["add_basemap"]
+    finally:
+        await coordinator.close()
+
+
+async def test_compact_task_can_load_and_style_a_vector_without_map_output(tmp_path):
+    require_qgis()
+    source = tmp_path / "points.geojson"
+    source.write_text(json.dumps({
+        "type": "FeatureCollection", "features": [{"type": "Feature", "properties": {},
+        "geometry": {"type": "Point", "coordinates": [100, 30]}}],
+    }))
+    coordinator = TaskCoordinator(QgisBridge(120), tmp_path / "layers-state")
+    try:
+        tools = {tool.name: tool for tool in build_tools(coordinator, compact=True)}
+        await tools["task_start"].ainvoke({
+            "goal": "Load and style the point layer",
+            "inputs": {"points": {"path": str(source)}},
+            "vector_styles": {"points": {"color": "#ff0000", "size": 4}},
+        })
+        completed = await tools["task_execute"].ainvoke({})
+        assert completed["status"] == "COMPLETED"
+        assert [step["action"] for step in completed["completed_steps"]] == ["load", "style_vector"]
+    finally:
+        await coordinator.close()
+
+
+async def test_compact_common_layer_style_query_and_project_updates(tmp_path):
+    require_qgis()
+    source = tmp_path / "managed-points.geojson"
+    source.write_text(json.dumps({
+        "type": "FeatureCollection",
+        "features": [
+            {"type": "Feature", "properties": {"name": "A", "value": 1},
+             "geometry": {"type": "Point", "coordinates": [100, 30]}},
+            {"type": "Feature", "properties": {"name": "B", "value": 2},
+             "geometry": {"type": "Point", "coordinates": [101, 31]}},
+        ],
+    }))
+    coordinator = TaskCoordinator(QgisBridge(120), tmp_path / "managed-state")
+    try:
+        tools = {tool.name: tool for tool in build_tools(coordinator, compact=True)}
+        await tools["task_start"].ainvoke({
+            "goal": "Load, classify and organize points",
+            "inputs": {"points": {"path": str(source)}},
+            "vector_styles": {"points": {
+                "renderer": "graduated", "graduated_field": "value",
+                "classes": 2, "method": "equal_interval",
+            }},
+            "layer_operations": [
+                {"action": "rename", "layer": "points", "name": "Styled points"},
+                {"action": "opacity", "layer": "points", "opacity": 0.7},
+                {"action": "group", "name": "Analysis", "layers": ["points"]},
+            ],
+            "project_update": {"title": "Managed project", "crs": "EPSG:3857"},
+        })
+        completed = await tools["task_execute"].ainvoke({})
+        assert completed["status"] == "COMPLETED"
+        assert [step["action"] for step in completed["completed_steps"]] == [
+            "load", "style_vector", "layer_manage", "layer_manage", "layer_manage",
+            "project_update",
+        ]
+        project = await tools["project_info"].ainvoke({})
+        assert project["title"] == "Managed project"
+        assert project["crs"] == "EPSG:3857"
+        assert project["layers"][0]["name"] == "Styled points"
+        ruled = await coordinator.bridge.call("style_vector", {
+            "layer": project["layers"][0]["id"], "renderer": "rule_based",
+            "marker": "triangle", "line_style": "dash",
+            "rules": [{
+                "expression": '"value" = 1', "label": "First",
+                "color": "#ff0000", "outline": "#000000", "size": 3, "width": 0.5,
+            }],
+        })
+        assert ruled["renderer"] == "RuleRenderer"
+
+        sample = await tools["data_info"].ainvoke({
+            "source": str(source), "query": {"action": "sample", "limit": 1},
+        })
+        assert len(sample["features"]) == 1
+        statistics = await tools["data_info"].ainvoke({
+            "source": str(source), "query": {"action": "statistics", "field": "value"},
+        })
+        assert statistics["count"] == 2
+        assert statistics["mean"] == 1.5
+
+        updated = await tools["task_update"].ainvoke({
+            "task_id": completed["task_id"], "instruction": "Hide the point layer",
+            "layer_operations": [{"action": "visibility", "layer": "map_points", "visible": False}],
+        })
+        assert updated["next_call"] == {"tool": "task_execute", "arguments": {}}
+        assert (await tools["task_execute"].ainvoke({}))["status"] == "COMPLETED"
+        assert (await tools["project_info"].ainvoke({}))["layers"][0]["visible"] is False
+    finally:
+        await coordinator.close()
+
+
+async def test_compact_task_loads_a_declared_qml_style(tmp_path):
+    require_qgis()
+    source = tmp_path / "qml-points.geojson"
+    source.write_text(json.dumps({
+        "type": "FeatureCollection",
+        "features": [{
+            "type": "Feature", "properties": {"name": "A"},
+            "geometry": {"type": "Point", "coordinates": [100, 30]},
+        }],
+    }))
+    qml = tmp_path / "points.qml"
+    seed = TaskCoordinator(QgisBridge(120), tmp_path / "qml-seed-state")
+    try:
+        layer = await seed.bridge.call("load_data", {
+            "path": str(source), "name": "Seed", "kind": "vector",
+        })
+        await seed.bridge.call("style_vector", {
+            "layer": layer["id"], "renderer": "single", "color": "#ff0000",
+        })
+        await seed.bridge.call("style_file", {
+            "action": "save", "layer": layer["id"], "path": str(qml),
+        })
+    finally:
+        await seed.close()
+
+    coordinator = TaskCoordinator(QgisBridge(120), tmp_path / "qml-state")
+    try:
+        tools = {tool.name: tool for tool in build_tools(coordinator, compact=True)}
+        await tools["task_start"].ainvoke({
+            "goal": "Load points with the supplied QML style",
+            "inputs": {
+                "points": {"path": str(source)},
+                "point_style": {"path": str(qml), "kind": "style"},
+            },
+            "vector_styles": {
+                "points": {"renderer": "qml", "qml_asset": "point_style"},
+            },
+        })
+        completed = await tools["task_execute"].ainvoke({})
+        assert completed["status"] == "COMPLETED"
+        assert [step["action"] for step in completed["completed_steps"]] == [
+            "load", "style_vector",
+        ]
+        project = await tools["project_info"].ainvoke({})
+        assert project["layers"][0]["name"] == "map_points"
+    finally:
+        await coordinator.close()
+
+
+async def test_compact_project_create_save_and_open(tmp_path):
+    require_qgis()
+    project_path = tmp_path / "managed.qgz"
+    creator = TaskCoordinator(QgisBridge(120), tmp_path / "project-create-state")
+    try:
+        tools = {tool.name: tool for tool in build_tools(creator, compact=True)}
+        await tools["task_start"].ainvoke({
+            "goal": "Create an empty managed project",
+            "project": {"action": "create", "crs": "EPSG:3857", "title": "Managed"},
+            "deliverables": [{
+                "id": "project", "kind": "project", "description": "Editable project",
+                "path": str(project_path),
+            }],
+        })
+        completed = await tools["task_execute"].ainvoke({})
+        assert completed["status"] == "COMPLETED"
+        assert project_path.is_file()
+        assert [step["action"] for step in completed["completed_steps"]] == [
+            "project_setup", "save_project",
+        ]
+    finally:
+        await creator.close()
+
+    opener = TaskCoordinator(QgisBridge(120), tmp_path / "project-open-state")
+    try:
+        tools = {tool.name: tool for tool in build_tools(opener, compact=True)}
+        await tools["task_start"].ainvoke({
+            "goal": "Open the managed project",
+            "project": {"action": "open", "path": str(project_path)},
+        })
+        assert (await tools["task_execute"].ainvoke({}))["status"] == "COMPLETED"
+        project = await tools["project_info"].ainvoke({})
+        assert project["title"] == "Managed"
+        assert project["crs"] == "EPSG:3857"
+    finally:
+        await opener.close()
+
+
+async def test_single_frame_map_common_projection_and_element_options(tmp_path):
+    require_qgis()
+    source = tmp_path / "raw-source-name.geojson"
+    source.write_text(json.dumps({
+        "type": "FeatureCollection",
+        "features": [
+            {"type": "Feature", "properties": {"name": "A"},
+             "geometry": {"type": "Point", "coordinates": [100, 30]}},
+            {"type": "Feature", "properties": {"name": "B"},
+             "geometry": {"type": "Point", "coordinates": [101, 31]}},
+        ],
+    }))
+    bridge = QgisBridge(120)
+    try:
+        loaded = await bridge.call("load_data", {
+            "path": str(source), "kind": "vector", "name": "调查点",
+        })
+        result = await bridge.call("layout", {
+            "name": "个性化单框图", "title": "调查点分布图",
+            "layers": [loaded["id"]], "extent_layer": loaded["id"],
+            "crs": "EPSG:3857", "grid_crs": "EPSG:4326",
+            "coordinate_annotations": {
+                "sides": ["bottom", "left"],
+                "format": "degree_minute_second", "precision": 1,
+                "cardinal_directions": True, "density": "sparse",
+                "grid_lines": True,
+            },
+            "map_elements": {
+                "legend": {"flow": "vertical", "border": True},
+                "scalebar": {"units": "miles", "style": "double_box"},
+            },
+        })
+        assert result["crs"] == "EPSG:3857"
+        assert result["legend_layer_names"] == ["调查点"]
+        assert result["legend_flow"] == "vertical"
+        assert result["legend_border"] is True
+        assert result["scalebar"] == {"units": "miles", "style": "double_box"}
+        assert result["coordinate_annotations"] == {
+            "crs": "EPSG:4326", "format": "degree_minute_second",
+            "precision": 1, "cardinal_directions": True, "density": "sparse",
+            "interval": result["coordinate_annotations"]["interval"],
+            "grid_lines": True, "sides": ["bottom", "left"],
+        }
+    finally:
+        await bridge.close()
+
+
+async def test_coordinate_suffixes_reject_a_projected_annotation_crs_before_task_creation(tmp_path):
+    require_qgis()
+    coordinator = TaskCoordinator(QgisBridge(120), tmp_path / "invalid-coordinate-state")
+    try:
+        tools = {tool.name: tool for tool in build_tools(coordinator, compact=True)}
+        with pytest.raises(TaskError) as failure:
+            await tools["task_start"].ainvoke({
+                "goal": "Create a map with projected coordinate labels and compass suffixes",
+                "coordinate_crs": "EPSG:3857",
+                "coordinate_annotations": {"cardinal_directions": True},
+            })
+        assert failure.value.payload["code"] == "INVALID_COORDINATE_FORMAT"
+        assert coordinator.store is None
+    finally:
+        await coordinator.close()
+
+
+async def test_wfs_is_compiled_as_a_vector_overlay_and_advanced_raster_schema_is_explicit(tmp_path):
+    require_qgis()
+    coordinator = TaskCoordinator(QgisBridge(120), tmp_path / "wfs-compile-state")
+    try:
+        tools = {tool.name: tool for tool in build_tools(coordinator, compact=True)}
+        started = await tools["task_start"].ainvoke({
+            "goal": "Add a WFS road layer",
+            "services": {"roads": {
+                "provider": "wfs", "url": "https://example.test/wfs",
+                "type_name": "roads",
+            }},
+        })
+        contract = coordinator.compile_recipe({
+            "task_id": started["task_id"], "action": "add_basemap", "output": "roads",
+            "service": {
+                "provider": "wfs", "url": "https://example.test/wfs",
+                "type_name": "roads", "role": "overlay",
+            },
+        })
+        assert contract["arguments"]["service"] == "wfs"
+        assert contract["outputs"] == [{"id": "roads", "kind": "vector", "binding": "layer"}]
+
+        from smart_qgis.task_tools import TaskRun
+        request = TaskRun.model_validate({
+            "goal": "Render a multispectral raster",
+            "raster_styles": {"image": {
+                "mode": "rgb", "red": 4, "green": 3, "blue": 2,
+            }},
+        })
+        assert request.raster_styles["image"].model_dump()["red"] == 4
+
+        raster = await coordinator.bridge.call("run_processing", {
+            "algorithm": "native:createconstantrasterlayer",
+            "parameters": {
+                "EXTENT": "0,10,0,10 [EPSG:3857]", "TARGET_CRS": "EPSG:3857",
+                "PIXEL_SIZE": 1, "NUMBER": 5, "OUTPUT": str(tmp_path / "display.tif"),
+            },
+            "load_outputs": True,
+        })
+        rendered = await coordinator.bridge.call("render_raster", {
+            "layer": raster["loaded_layers"][0]["id"], "mode": "gray", "band": 1,
+            "red": 1, "green": 2, "blue": 3, "azimuth": 315, "altitude": 45,
+            "z_factor": 1, "opacity": 1,
+        })
+        assert rendered["renderer"] == "singlebandgray"
+    finally:
+        await coordinator.close()
+
+
+async def test_compact_vector_edit_exports_a_copy_and_preserves_source(tmp_path):
+    require_qgis()
+    source = tmp_path / "source.geojson"
+    original = {
+        "type": "FeatureCollection",
+        "features": [
+            {"type": "Feature", "properties": {"name": "A", "value": 1},
+             "geometry": {"type": "Point", "coordinates": [100, 30]}},
+            {"type": "Feature", "properties": {"name": "B", "value": 2},
+             "geometry": {"type": "Point", "coordinates": [101, 31]}},
+        ],
+    }
+    source.write_text(json.dumps(original))
+    original_bytes = source.read_bytes()
+    output = tmp_path / "edited.gpkg"
+    coordinator = TaskCoordinator(QgisBridge(120), tmp_path / "edit-state")
+    try:
+        tools = {tool.name: tool for tool in build_tools(coordinator, compact=True)}
+        sample = await tools["data_info"].ainvoke({
+            "source": str(source), "query": {"action": "sample", "limit": 2},
+        })
+        feature_id = sample["features"][0]["id"]
+        await tools["task_start"].ainvoke({
+            "goal": "Edit a copy of the source layer",
+            "inputs": {"source": {"path": str(source)}},
+            "deliverables": [{
+                "id": "edited", "kind": "vector", "description": "Edited copy",
+                "path": str(output),
+            }],
+            "data_operations": [{
+                "action": "edit", "layer": "source", "output": "edited",
+                "updates": [{"feature_id": feature_id, "attributes": {"name": "Updated"}}],
+                "expression": "\"value\" = 2",
+            }],
+        })
+        completed = await tools["task_execute"].ainvoke({})
+        assert completed["status"] == "COMPLETED"
+        assert output.is_file()
+        assert source.read_bytes() == original_bytes
+        edited = await tools["data_info"].ainvoke({
+            "source": str(output), "query": {"action": "sample", "limit": 10},
+        })
+        assert len(edited["features"]) == 1
+        assert edited["features"][0]["properties"]["name"] == "Updated"
     finally:
         await coordinator.close()
 
@@ -897,13 +1338,12 @@ async def test_compact_processing_rebuilds_current_action_after_guidance_and_rec
         assert started["route"] == "processing_required"
         prepared = await tools["prepare_algorithm"].ainvoke({
             "task_id": started["task_id"],
-            "step_id": "create_centroids",
             "algorithm": "native:centroids",
             "inputs": {"INPUT": "area"},
             "outputs": {"OUTPUT": "centroids"},
         })
         assert "continuation_token" not in prepared
-        assert prepared["next_call"] == {"tool": "task_execute_next", "arguments": {}}
+        assert prepared["next_call"] == {"tool": "task_execute", "arguments": {}}
 
         version = coordinator.store.task()["state_version"]
         await coordinator.clarify({
@@ -912,10 +1352,10 @@ async def test_compact_processing_rebuilds_current_action_after_guidance_and_rec
             "question": "Continue the prepared centroid step?",
             "user_response": "Yes, continue the same task.",
         })
-        recovered = await tools["task_recover"].ainvoke({"task_id": started["task_id"]})
+        recovered = await tools["task_resume"].ainvoke({"task_id": started["task_id"]})
         assert "continuation_token" not in recovered
 
-        final = await tools["task_execute_next"].ainvoke({})
+        final = await tools["task_execute"].ainvoke({})
         assert final["status"] == "COMPLETED"
         assert "continuation_token" not in final
         assert Path(final["assets"]["centroids"]["path"]).is_file()
@@ -1005,7 +1445,7 @@ async def run():
                 original_commit(attempt_id)
             os._exit(81)
         co.store.commit = crash_at_commit
-    await tools['task_execute'].ainvoke(state['next_call']['arguments'])
+    await tools['step_execute'].ainvoke(state['next_call']['arguments'])
 asyncio.run(run())
 """
     process = await __import__("asyncio").to_thread(
@@ -1089,7 +1529,7 @@ async def test_disk_full_during_checkpoint_preserves_previous_project(tmp_path, 
             "continuation_token": current["continuation_token"],
             "retry_step": "points", "reason": "Simulated disk capacity restored",
         })
-        result = await tools["task_execute"].ainvoke(recovered["next_call"]["arguments"])
+        result = await tools["step_execute"].ainvoke(recovered["next_call"]["arguments"])
         assert Path(result["assets"]["points"]["path"]).is_file()
         attempts = list(coordinator.store.db.execute("SELECT status FROM attempts ORDER BY created"))
         assert [row[0] for row in attempts] == ["FAILED", "COMMITTED"]
@@ -1121,7 +1561,7 @@ async def test_tampered_artifact_blocks_cached_success_and_resume(tmp_path):
         with artifact.open("ab") as stream:
             stream.write(b"changed content")
         with pytest.raises(TaskError, match="modified"):
-            await tools["task_execute"].ainvoke(request)
+            await tools["step_execute"].ainvoke(request)
         with pytest.raises(TaskError, match="modified"):
             await tools["task_recover"].ainvoke({"task_id": status["task_id"]})
     finally:
@@ -1379,10 +1819,11 @@ async def test_repair_preserves_independent_results_and_project_state(tmp_path, 
                 {**points(), "name": "Later layer"},
                 [{"id": "later_layer", "kind": "vector", "binding": "layer"}],
             )
-        compact_tools = {tool.name: tool for tool in build_tools(coordinator, compact=True)}
-        status = await compact_tools["task_invalidate"].ainvoke(
+        direct_tools = {tool.name: tool for tool in build_tools(coordinator)}
+        status = await direct_tools["task_invalidate"].ainvoke(
             {
                 "task_id": status["task_id"],
+                "continuation_token": status["continuation_token"],
                 "steps": [repair_target],
                 "reason": "Replace incorrect candidate",
             }
@@ -1578,7 +2019,7 @@ async def test_error_after_database_commit_keeps_success_and_does_not_repeat(tmp
         )
         assert status["status"] == "READY"
         assert status["attempts"][0]["status"] == "COMMITTED"
-        assert await tools["task_execute"].ainvoke(request) == result
+        assert await tools["step_execute"].ainvoke(request) == result
         assert len((await tools["layer_info"].ainvoke({}))["layers"]) == 1
         assert coordinator.store.db.execute("SELECT count(*) FROM attempts").fetchone()[0] == 1
     finally:
@@ -1650,7 +2091,7 @@ async def test_contract_revision_revalidates_durable_result_without_reexecution(
         # Direct mutation tools stay hidden; reading an old step does not re-authorize task_execute.
         assert "vector_data" not in tools
         with pytest.raises(TaskError) as invalidated_saved:
-            await tools["task_execute"].ainvoke({
+            await tools["step_execute"].ainvoke({
                 "task_id": status["task_id"], "step_id": "points",
                 "continuation_token": coordinator.issue_continuation("execute", "points"),
             })
@@ -1834,7 +2275,7 @@ async def test_unrelated_discarded_attempt_can_explicitly_retry_unchanged(tmp_pa
             "task_id": status["task_id"], "continuation_token": status["continuation_token"],
             "retry_step": "pending", "reason": "Input revision is committed; this input and contract did not change",
         })
-        result = await tools["task_execute"].ainvoke(status["next_call"]["arguments"])
+        result = await tools["step_execute"].ainvoke(status["next_call"]["arguments"])
         assert Path(result["assets"]["projected"]["path"]).is_file()
         assert coordinator.store.db.execute("SELECT status FROM steps WHERE id='pending'").fetchone()[0] == "COMMITTED"
         assert coordinator.store.db.execute("SELECT count(*) FROM attempts").fetchone()[0] == 2
@@ -1872,13 +2313,13 @@ async def test_generic_mcp_client_discovers_corrects_executes_and_resumes(tmp_pa
         schemas = {tool.name: tool.inputSchema for tool in (await session.list_tools()).tools}
         assert 'vector_data' not in schemas
         assert 'step_prepare' in schemas
-        assert set(schemas['task_execute']['required']) == {
+        assert set(schemas['step_execute']['required']) == {
             'task_id', 'step_id', 'continuation_token'
         }
-        assert schemas['task_execute']['additionalProperties'] is False
+        assert schemas['step_execute']['additionalProperties'] is False
         invalid_cases = [
-            ('task_execute', {'task_id': 'private-test-marker'}),
-            ('task_execute', {'task_id': 'task', 'step_id': 'step',
+            ('step_execute', {'task_id': 'private-test-marker'}),
+            ('step_execute', {'task_id': 'task', 'step_id': 'step',
                               'expected_state_version': 'private-test-marker'}),
             ('task_contract_submit', {'task_id': 'task', 'continuation_token': 'token',
                                       'contract': {}, 'step_id': 'step'}),
@@ -1891,8 +2332,8 @@ async def test_generic_mcp_client_discovers_corrects_executes_and_resumes(tmp_pa
             assert 'private-test-marker' not in json.dumps(invalid)
             assert invalid['next_action']
             if invalid.get('correction_budget', {}).get('remaining') == 0:
-                await call(session, 'task_record_guidance', {'question': 'Continue independent argument fixtures?', 'user_response': 'Yes.'})
-        await call(session, 'task_record_guidance', {'question': 'Continue the independent schema fixtures?', 'user_response': 'Yes, test the next fixture.'})
+                await call(session, 'task_update', {'question': 'Continue independent argument fixtures?', 'user_response': 'Yes.'})
+        await call(session, 'task_update', {'question': 'Continue the independent schema fixtures?', 'user_response': 'Yes, test the next fixture.'})
         # Give schema-derived corrections for common local-model mistakes,
         # without repeating submitted paths, goals or invalid values.
         for fields, expected in [
@@ -1926,7 +2367,7 @@ async def test_generic_mcp_client_discovers_corrects_executes_and_resumes(tmp_pa
             ('task_validate', {'revalidate_steps': ['step', 'step']},
              'revalidation_unique', 'duplicates'),
         ]
-        await call(session, 'task_record_guidance', {'question': 'Continue the cross-field fixtures?', 'user_response': 'Yes.'})
+        await call(session, 'task_update', {'question': 'Continue the cross-field fixtures?', 'user_response': 'Yes.'})
         for name, fields, rule, hint in rule_cases:
             invalid = await call(session, name, {
                 'task_id': 'private-test-marker', **fields,
@@ -1934,9 +2375,9 @@ async def test_generic_mcp_client_discovers_corrects_executes_and_resumes(tmp_pa
             detail = invalid['evidence']['errors'][0]
             assert detail['rule'] == rule and hint in detail['message']
             if invalid.get('correction_budget', {}).get('remaining') == 0:
-                await call(session, 'task_record_guidance', {'question': 'Continue the remaining fixtures?', 'user_response': 'Yes.'})
+                await call(session, 'task_update', {'question': 'Continue the remaining fixtures?', 'user_response': 'Yes.'})
             assert 'private-test-marker' not in json.dumps(invalid)
-        await call(session, 'task_record_guidance', {'question': 'Start the independent creation-budget fixture?', 'user_response': 'Yes.'})
+        await call(session, 'task_update', {'question': 'Start the independent creation-budget fixture?', 'user_response': 'Yes.'})
         invalid = await call(session, 'task_begin', {
             'goal': 'private-test-marker',
             'deliverables': [{'id': 'same', 'kind': 'vector', 'description': 'private-test-marker'}] * 2,
@@ -1988,7 +2429,7 @@ async def test_generic_mcp_client_discovers_corrects_executes_and_resumes(tmp_pa
                               error='UNKNOWN_TOOL')
         assert rejected['next_action'] == 'tools/list'
         execution_context = status['next_call']['arguments']
-        result = await call(session, 'task_execute', execution_context)
+        result = await call(session, 'step_execute', execution_context)
         assert Path(result['assets']['points']['path']).is_file()
         persisted_task = await call(session, 'contract_get', {'task_id': task_id})
         persisted_step = await call(session, 'contract_get', {'task_id': task_id, 'step_id': 'points'})
@@ -2014,7 +2455,7 @@ async def test_generic_mcp_client_discovers_corrects_executes_and_resumes(tmp_pa
         assert restored_task['contract'] == persisted_task['contract']
         assert restored_step['contract'] == persisted_step['contract']
         assert restored_step['status'] == 'COMMITTED'
-        assert await call(session, 'task_execute', execution_context) == result
+        assert await call(session, 'step_execute', execution_context) == result
         assert len((await call(session, 'layer_info', {}))['layers']) == 1
         status = await call(session, 'task_finish', {
             'task_id': task_id, 'continuation_token': status['continuation_token']})
@@ -2050,7 +2491,7 @@ async def test_processing_preflight_rejects_bad_parameters_and_questions_before_
         assert co.store.db.execute('SELECT count(*) FROM attempts').fetchone()[0] == 0
         proposal['unresolved_questions'] = []
         approved = await tools['step_contract_submit'].ainvoke(request)
-        assert approved['next_call']['tool'] == 'task_execute'
+        assert approved['next_call']['tool'] == 'step_execute'
         assert co.correction_failures() == 1
         assert co.store.db.execute('SELECT count(*) FROM attempts').fetchone()[0] == 0
     finally:
@@ -2167,3 +2608,38 @@ async def test_grass_processing_materializes_managed_raster_source(tmp_path):
         assert summary["bands"][0]["maximum"] == 0.0
     finally:
         await bridge.close()
+
+
+async def test_compact_task_writes_declared_final_output_path(tmp_path):
+    """A user-selected deliverable path is the actual artifact, not a post-task copy."""
+    require_qgis()
+    target = tmp_path / "desktop" / "constant.tif"
+    coordinator = TaskCoordinator(QgisBridge(120), tmp_path / "state")
+    try:
+        tools = {tool.name: tool for tool in build_tools(coordinator, compact=True)}
+        started = await tools["task_start"].ainvoke({
+            "goal": "Create one constant raster",
+            "inputs": {},
+            "deliverables": [{
+                "id": "result", "kind": "raster", "description": "Constant raster",
+                "path": str(target),
+            }],
+        })
+        prepared = await tools["prepare_algorithm"].ainvoke({
+            "task_id": started["task_id"],
+            "algorithm": "native:createconstantrasterlayer",
+            "outputs": {"OUTPUT": "result"},
+            "parameters": {
+                "EXTENT": "0,10,0,10 [EPSG:3857]",
+                "TARGET_CRS": "EPSG:3857",
+                "PIXEL_SIZE": 1,
+                "NUMBER": 5,
+            },
+        })
+        assert prepared["next_call"]["tool"] == "task_execute"
+        completed = await tools["task_execute"].ainvoke({})
+        assert completed["status"] == "COMPLETED"
+        assert completed["assets"]["result"]["path"] == str(target)
+        assert target.is_file() and target.stat().st_size > 0
+    finally:
+        await coordinator.close()

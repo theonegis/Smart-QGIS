@@ -36,6 +36,6 @@ Pi 需要其 MCP 适配扩展。可在项目/试次的独立 MCP 配置文件中
 
 ## 共同约定
 
-可靠模式的标准地图/工程为 `task_start → task_execute_next()`；通用 Processing 为 `task_start → 确认算法 ID → prepare_algorithm → task_execute_next()`，仅在返回真实缺参问题时才询问用户并调用 `task_answer`。所有调用以当前会话的 MCP 工具列表和参数 schema 为准，不能猜不存在的工具。失败后诊断、用户指导及恢复见[用法说明](reliable-usage.md)。
+可靠模式的标准地图/工程为 `task_start → task_execute()`；通用 Processing 为 `task_start → 确认算法 ID → prepare_algorithm → task_execute()`，仅在返回真实缺参问题时才询问用户并调用 `task_answer`。工程、数据、样式、底图和制图修订分别使用 `project_info`、`data_info` 与 `task_update`；所有调用以当前会话的 MCP 工具列表和参数 schema 为准，不能猜不存在的工具。失败后诊断、用户指导及恢复见[用法说明](reliable-usage.md)。
 
 一个 MCP 进程的 QGIS 操作串行执行。不同客户端不应同时写同一任务状态目录或输出文件。新进程须用相同 `SMART_QGIS_STATE_DIR` 和原 task ID 恢复。该本地工具具有运行用户的文件权限，不应直接暴露为无鉴权公网服务。

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -15,6 +16,117 @@ Nonempty = Annotated[str, Field(min_length=1)]
 
 class Model(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+
+MapElementFrame = Literal["inside", "outside"]
+MapElementAnchor = Literal[
+    "top_left", "top", "top_right", "left", "center", "right",
+    "bottom_left", "bottom", "bottom_right",
+]
+
+
+class MapElementPlacement(Model):
+    """One optional, user-directed placement constraint for a map item."""
+
+    frame: MapElementFrame | None = Field(
+        None, description="inside the map frame, outside it on the page, or null for server choice"
+    )
+    anchor: MapElementAnchor | None = Field(
+        None, description="Nine-position anchor or null for server choice"
+    )
+
+    @model_validator(mode="after")
+    def meaningful_outside_anchor(self):
+        if self.frame == "outside" and self.anchor == "center":
+            raise ValueError("outside map elements cannot use the center anchor")
+        return self
+
+
+class LegendPlacement(MapElementPlacement):
+    flow: Literal["auto", "horizontal", "vertical"] = Field(
+        "auto", description="Legend item flow; auto follows available map/page space"
+    )
+    border: bool | None = Field(
+        None, description="Show or hide the legend border; null keeps the server default"
+    )
+
+
+class ScaleBarPlacement(MapElementPlacement):
+    units: Literal["auto", "meters", "kilometers", "miles"] = Field(
+        "auto", description="Scale-bar units; auto chooses readable metric units"
+    )
+    style: Literal["single_box", "double_box", "line_ticks_middle"] = Field(
+        "single_box", description="Common QGIS scale-bar style"
+    )
+
+
+class MapElements(Model):
+    """Independent placement preferences. Omitted fields are server-resolved."""
+
+    legend: LegendPlacement | None = None
+    scalebar: ScaleBarPlacement | None = None
+    north_arrow: MapElementPlacement | None = None
+    title: MapElementPlacement | None = None
+
+    @model_validator(mode="after")
+    def distinct_explicit_positions(self):
+        occupied = {}
+        for name in ("legend", "scalebar", "north_arrow", "title"):
+            item = getattr(self, name)
+            if item and item.frame and item.anchor:
+                key = (item.frame, item.anchor)
+                if key in occupied:
+                    raise ValueError(
+                        f"{name} and {occupied[key]} cannot use the same explicit map position"
+                    )
+                occupied[key] = name
+        return self
+
+
+class MapFrame(Model):
+    """How the server should size the thematic map frame and its page."""
+
+    mode: Literal["auto", "maximize"] = Field(
+        "maximize",
+        description="auto chooses a compact page from the data footprint; maximize (default) makes the map frame use the available page width or height",
+    )
+    min_page_coverage: float | None = Field(
+        None, ge=0.2, le=0.9,
+        description="Optional user-required minimum fraction of page area occupied by the map frame",
+    )
+
+
+class CoordinateAnnotations(Model):
+    """Coordinate labels belong to map-frame sides rather than free page anchors."""
+
+    sides: list[Literal["top", "bottom", "left", "right"]] | None = Field(
+        None, min_length=1,
+        description="Annotated map-frame sides, or null for server choice",
+    )
+    format: Literal["auto", "decimal", "degree_minute", "degree_minute_second"] = Field(
+        "auto",
+        description="Coordinate label format; degree formats require a geographic annotation CRS",
+    )
+    precision: int | None = Field(
+        None, ge=0, le=6,
+        description="Optional label precision; omit for the server default",
+    )
+    cardinal_directions: bool | None = Field(
+        None,
+        description="For geographic labels, show or hide E/W/N/S; null keeps the server default",
+    )
+    density: Literal["auto", "dense", "sparse"] = Field(
+        "auto", description="Common coordinate tick/label density preset"
+    )
+    grid_lines: bool = Field(
+        False, description="Draw interior grid lines in addition to frame ticks and labels"
+    )
+
+    @model_validator(mode="after")
+    def distinct_sides(self):
+        if self.sides and len(set(self.sides)) != len(self.sides):
+            raise ValueError("coordinate annotation sides must not contain duplicates")
+        return self
 
 
 class CheckBase(Model):
@@ -116,8 +228,17 @@ class LayoutContent(CheckBase):
     require_title: bool = False
     require_legend: bool = False
     require_scalebar: bool = False
+    require_north_arrow: bool = False
     require_grid: bool = False
     grid_crs: Nonempty | None = Field(None, description="Require an enabled annotated grid in this CRS")
+    element_placements: dict[Literal["legend", "scalebar", "north_arrow", "title"], dict[str, str | None]] = Field(
+        default_factory=dict,
+        description="Explicit per-element frame/anchor placements to verify",
+    )
+    min_page_coverage: float | None = Field(
+        None, ge=0.2, le=0.9,
+        description="Optional minimum fraction of page area occupied by the main map frame",
+    )
 
     @model_validator(mode="after")
     def meaningful(self):
@@ -126,8 +247,11 @@ class LayoutContent(CheckBase):
             or self.require_title
             or self.require_legend
             or self.require_scalebar
+            or self.require_north_arrow
             or self.require_grid
             or self.grid_crs is not None
+            or self.element_placements
+            or self.min_page_coverage is not None
         ):
             raise ValueError(
                 "layout_content requires a title, legend, text, scale bar or coordinate grid"
@@ -199,6 +323,39 @@ class Deliverable(Model):
     id: SafeId
     description: Nonempty
     kind: Literal["vector", "raster", "project", "image", "pdf", "style", "template", "layout"]
+    path: str | None = Field(
+        None,
+        description=(
+            "Optional absolute final file path. Omit to keep this file in the system temporary "
+            "Smart-QGIS output directory. Mutually exclusive with directory."
+        ),
+    )
+    directory: str | None = Field(
+        None,
+        description=(
+            "Optional absolute final output directory. The service derives the filename from id and "
+            "kind. Mutually exclusive with path."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def normalize_destination(self):
+        if self.path and self.directory:
+            raise ValueError("Use either path or directory for a deliverable, not both")
+        if self.kind == "layout" and (self.path or self.directory):
+            raise ValueError("A layout is not a file deliverable and cannot have a path or directory")
+        for field in ("path", "directory"):
+            raw = getattr(self, field)
+            if raw is None:
+                continue
+            candidate = Path(raw).expanduser()
+            if not candidate.is_absolute():
+                raise ValueError(f"deliverable {field} must be an absolute path")
+            candidate = candidate.resolve()
+            if field == "path" and candidate.name in {"", ".", ".."}:
+                raise ValueError("deliverable path must name a file")
+            setattr(self, field, str(candidate))
+        return self
 
 
 def check_static_conflicts(checks):
@@ -238,7 +395,7 @@ class TaskContract(Model):
         default_factory=dict,
         description="Optional audit map from requirement IDs to required check IDs; may be omitted"
     )
-    map_omissions: list[Literal["title", "legend", "scalebar", "coordinates"]] = Field(
+    map_omissions: list[Literal["title", "legend", "scalebar", "north_arrow", "coordinates"]] = Field(
         default_factory=list,
         description="Map elements the user explicitly asked to remove",
     )

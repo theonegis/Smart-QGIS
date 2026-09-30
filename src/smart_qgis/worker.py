@@ -12,6 +12,8 @@ import os
 import re
 import sys
 import tempfile
+from collections import OrderedDict
+from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -22,7 +24,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 worker_profile = tempfile.TemporaryDirectory(prefix="smart-qgis-profile-")
 os.environ["QGIS_CUSTOM_CONFIG_PATH"] = worker_profile.name
 os.environ["QGIS_AUTH_DB_DIR_PATH"] = worker_profile.name
-sys.path.insert(0, os.environ.get("SMART_QGIS_PLUGIN_PATH", "/usr/share/qgis/python/plugins"))
+plugin_path = os.environ.get("SMART_QGIS_PLUGIN_PATH")
+if plugin_path:
+    sys.path.insert(0, plugin_path)
 
 from qgis.analysis import QgsRasterCalcNode  # noqa: E402
 from qgis.core import (  # noqa: E402
@@ -34,16 +38,22 @@ from qgis.core import (  # noqa: E402
     QgsCoordinateTransform,
     QgsExpression,
     QgsFeatureRequest,
+    QgsFillSymbol,
     QgsLayoutExporter,
     QgsLayoutItemLabel,
     QgsLayoutItemLegend,
     QgsLayoutItemMap,
     QgsLayoutItemMapGrid,
+    QgsLayoutItemPicture,
     QgsLayoutItemScaleBar,
     QgsLayoutPoint,
     QgsLayoutSize,
+    QgsLineSymbol,
     QgsMapLayer,
     QgsMapLayerLegendUtils,
+    QgsMapRendererParallelJob,
+    QgsMapSettings,
+    QgsMarkerSymbol,
     QgsPalLayerSettings,
     QgsPrintLayout,
     QgsProcessingContext,
@@ -54,6 +64,7 @@ from qgis.core import (  # noqa: E402
     QgsReadWriteContext,
     QgsRectangle,
     QgsRendererCategory,
+    QgsRuleBasedRenderer,
     QgsSingleBandPseudoColorRenderer,
     QgsSingleSymbolRenderer,
     QgsStyle,
@@ -64,6 +75,7 @@ from qgis.core import (  # noqa: E402
     QgsVectorLayerSimpleLabeling,
     QgsWkbTypes,
 )
+from qgis.PyQt.QtCore import QSize, Qt  # noqa: E402
 from qgis.PyQt.QtGui import QColor, QFont  # noqa: E402
 
 if __package__:
@@ -155,7 +167,8 @@ def parameter_help(parameter):
 class Engine:
     def __init__(self):
         self.profile = worker_profile
-        QgsApplication.setPrefixPath(os.environ.get("QGIS_PREFIX_PATH", "/usr"), True)
+        if prefix := os.environ.get("QGIS_PREFIX_PATH"):
+            QgsApplication.setPrefixPath(prefix, True)
         self.app = QgsApplication([], False, self.profile.name)
         self.app.initQgis()
         from processing.core.Processing import Processing
@@ -168,6 +181,12 @@ class Engine:
         os.environ.pop("PYTHONPATH", None)
         self.project = QgsProject.instance()
         self.contexts = []  # Own temporary results for the lifetime of this project.
+        # Processing providers are initialized once per worker.  Build the
+        # searchable catalog lazily, then reuse it instead of walking the full
+        # registry for every model query.
+        self._algorithm_catalog = None
+        self._algorithm_search_cache = OrderedDict()
+        self._algorithm_help_cache = {}
         self.project.setCrs(crs("EPSG:4326"))
 
     def close(self):
@@ -283,7 +302,7 @@ class Engine:
     def project_op(self, a):
         action = a["action"]
         if action == "create":
-            target_crs = crs(a.get("crs", "EPSG:4326"))
+            target_crs = crs(a.get("crs") or "EPSG:4326")
             path = (
                 destination(a["path"], [".qgs", ".qgz"], a.get("overwrite", False))
                 if a.get("path")
@@ -292,7 +311,7 @@ class Engine:
             self.project.clear()
             self.contexts.clear()
             self.project.setCrs(target_crs)
-            self.project.setTitle(a.get("title", "Smart-QGIS"))
+            self.project.setTitle(a.get("title") or "Smart-QGIS")
             metadata = self.project.metadata()
             metadata.setAuthor("")
             self.project.setMetadata(metadata)
@@ -312,6 +331,11 @@ class Engine:
             ]
             if invalid:
                 raise ValueError(f"Project loaded with missing/invalid layers: {invalid}")
+        elif action == "update":
+            if a.get("crs"):
+                self.project.setCrs(crs(a["crs"]))
+            if a.get("title") is not None:
+                self.project.setTitle(a["title"])
         elif action == "save":
             memory = [
                 layer.name()
@@ -345,7 +369,7 @@ class Engine:
         return self.layer_info(layer)
 
     def add_basemap(self, a):
-        service, url = a.get("service", "osm"), a.get("url")
+        service, url, uri = a.get("service", "osm"), a.get("url"), a.get("uri")
         attribution = a.get("attribution") or ""
         if service == "osm":
             url = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
@@ -356,7 +380,7 @@ class Engine:
             ]
             url = f"https://mt0.google.com/vt/lyrs={variant}&x={{x}}&y={{y}}&z={{z}}"
             attribution = "© Google"
-        elif not url:
+        elif not (url or uri):
             raise ValueError("This service requires a URL/provider URI")
         if a.get("zmax", 19) < a.get("zmin", 0):
             raise ValueError("zmax must be >= zmin")
@@ -368,19 +392,46 @@ class Engine:
             uri = urlencode(
                 {"type": "xyz", "url": url, "zmin": a.get("zmin", 0), "zmax": a.get("zmax", 19)}
             )
-        else:
-            uri = url
-        layer = QgsRasterLayer(uri, a.get("name") or service.upper(), "wms")
+        elif uri is None:
+            values = {"url": url}
+            if service == "wfs":
+                values.update({
+                    "typename": a.get("type_name"),
+                    "version": a.get("version") or "2.0.0",
+                })
+                if a.get("crs"):
+                    values["srsname"] = a["crs"]
+            else:
+                values.update({
+                    "layers": a.get("layer_name"),
+                    "styles": a.get("style_name") or "",
+                    "format": a.get("image_format", "image/png"),
+                    "crs": a.get("crs") or self.project.crs().authid(),
+                })
+                if service == "wmts":
+                    values["type"] = "wmts"
+            if a.get("authcfg"):
+                values["authcfg"] = a["authcfg"]
+            uri = urlencode({key: value for key, value in values.items() if value is not None})
+        layer = (
+            QgsVectorLayer(uri, a.get("name") or "WFS", "WFS")
+            if service == "wfs"
+            else QgsRasterLayer(uri, a.get("name") or service.upper(), "wms")
+        )
         if not layer.isValid():
             raise ValueError(
                 "Invalid remote layer; verify URL, authorization and network connectivity"
             )
         layer.serverProperties().setAttribution(attribution)
-        layer.setCustomProperty("smart_qgis/basemap", True)
+        role = a.get("role") or ("overlay" if service == "wfs" else "basemap")
+        layer.setCustomProperty("smart_qgis/basemap", role == "basemap")
+        layer.setCustomProperty("smart_qgis/service", service)
+        layer.setCustomProperty("smart_qgis/service_role", role)
         before = self.ordered_layers()
         self.project.addMapLayer(layer)
-        self.set_order(before + [layer])
+        self.set_order(before + [layer] if role == "basemap" else [layer] + before)
         result = self.layer_info(layer)
+        result.update({"service": service, "role": role, "remote": True})
         result["note"] = (
             "Layer created; tile availability is verified when rendering, not by isValid()."
         )
@@ -394,12 +445,25 @@ class Engine:
     def layers(self, a):
         action = a.get("action", "list")
         if action == "order":
-            layers = [self.resolve(ref) for ref in a.get("order") or []]
-            if len(layers) != len(self.project.mapLayers()) or len(
-                {layer_item.id() for layer_item in layers}
-            ) != len(layers):
-                raise ValueError("order must contain every layer exactly once")
-            self.set_order(layers)
+            requested = [self.resolve(ref) for ref in a.get("order") or []]
+            if len({layer_item.id() for layer_item in requested}) != len(requested):
+                raise ValueError("order must not contain duplicate layers")
+            remaining = [layer for layer in self.ordered_layers() if layer not in requested]
+            self.set_order(requested + remaining)
+        elif action == "group":
+            refs = a.get("layers") or []
+            if not a.get("name") or not refs:
+                raise ValueError("group requires name and layers")
+            root = self.project.layerTreeRoot()
+            group = root.findGroup(a["name"]) or root.addGroup(a["name"])
+            for ref in refs:
+                layer = self.resolve(ref)
+                node = root.findLayer(layer.id())
+                if node is None:
+                    raise ValueError(f"Layer tree node not found: {ref}")
+                clone = node.clone()
+                group.addChildNode(clone)
+                node.parent().removeChildNode(node)
         elif action != "list":
             layer = self.resolve(a.get("layer"))
             if action == "remove":
@@ -412,16 +476,53 @@ class Engine:
                 self.project.layerTreeRoot().findLayer(layer.id()).setItemVisibilityChecked(
                     a.get("visible", True)
                 )
+            elif action == "opacity":
+                if a.get("opacity") is None:
+                    raise ValueError("opacity is required")
+                layer.setOpacity(a["opacity"])
+                layer.triggerRepaint()
         return {"layers": [self.layer_info(layer_item) for layer_item in self.ordered_layers()]}
 
     def features(self, a):
-        layer = self.resolve(a["layer"], QgsVectorLayer)
-        request = QgsFeatureRequest().setLimit(a.get("limit", 10))
+        try:
+            layer = self.resolve(a["layer"], QgsVectorLayer)
+        except ValueError:
+            source = Path(str(a["layer"])).expanduser()
+            if not source.is_absolute() or not source.is_file():
+                raise
+            layer = QgsVectorLayer(str(source), source.stem, "ogr")
+            if not layer.isValid():
+                raise ValueError(f"Cannot inspect vector source: {source}") from None
+        request = QgsFeatureRequest()
+        if a.get("action", "sample") == "sample":
+            request.setLimit(a.get("limit", 10))
         if a.get("expression"):
             expression = QgsExpression(a["expression"])
             if expression.hasParserError():
                 raise ValueError(expression.parserErrorString())
             request.setFilterExpression(a["expression"])
+        if a.get("action", "sample") == "statistics":
+            field = a.get("field")
+            index = layer.fields().indexFromName(field or "")
+            if index < 0 or not layer.fields()[index].isNumeric():
+                raise ValueError("Statistics require an existing numeric field")
+            count, missing, total, minimum, maximum = 0, 0, 0.0, math.inf, -math.inf
+            for feature in layer.getFeatures(request):
+                try:
+                    value = float(feature[index])
+                    if not math.isfinite(value):
+                        raise ValueError
+                except (TypeError, ValueError):
+                    missing += 1
+                    continue
+                count += 1
+                total += value
+                minimum, maximum = min(minimum, value), max(maximum, value)
+            return {
+                "field": field, "count": count, "null_or_nonnumeric": missing,
+                "minimum": minimum if count else None, "maximum": maximum if count else None,
+                "sum": total, "mean": total / count if count else None,
+            }
         features = []
         for f in layer.getFeatures(request):
             features.append(
@@ -438,38 +539,72 @@ class Engine:
 
     def style_vector(self, a):
         layer = self.resolve(a["layer"], QgsVectorLayer)
-        fill, stroke = color(a.get("color", "#4c78a8")), color(a.get("outline", "#202020"))
+        line_styles = {
+            "solid": "solid", "dash": "dash", "dot": "dot",
+            "dash_dot": "dash dot", "dash_dot_dot": "dash dot dot",
+        }
 
-        def symbol(fill_color):
-            s = QgsSymbol.defaultSymbol(layer.geometryType())
-            s.setColor(fill_color)
-            sl = s.symbolLayer(0)
+        def symbol(spec=None):
+            spec = spec or a
+            fill = spec.get("color", a.get("color", "#4c78a8"))
+            stroke = spec.get("outline", a.get("outline", "#202020"))
+            width = spec.get("width", a.get("width", 0.4))
+            size = spec.get("size", a.get("size", 2))
+            line_style = line_styles[a.get("line_style", "solid")]
             geometry = int(layer.geometryType())
-            if geometry == 2:  # Polygon
-                sl.setStrokeColor(stroke)
-                sl.setStrokeWidth(a.get("width", 0.4))
-            elif geometry == 1:
-                s.setWidth(a.get("width", 0.4))
-            elif geometry == 0:
-                s.setSize(a.get("size", 2))
-                if hasattr(sl, "setStrokeColor"):
-                    sl.setStrokeColor(stroke)
-                    sl.setStrokeWidth(a.get("width", 0.4))
-            return s
+            if geometry == 0:
+                return QgsMarkerSymbol.createSimple({
+                    "name": a.get("marker", "circle"), "color": fill,
+                    "outline_color": stroke, "outline_width": str(width),
+                    "size": str(size),
+                })
+            if geometry == 1:
+                return QgsLineSymbol.createSimple({
+                    "line_color": fill, "line_width": str(width),
+                    "line_style": line_style,
+                })
+            if geometry == 2:
+                return QgsFillSymbol.createSimple({
+                    "color": fill, "outline_color": stroke,
+                    "outline_width": str(width), "outline_style": line_style,
+                })
+            result = QgsSymbol.defaultSymbol(layer.geometryType())
+            result.setColor(color(fill))
+            return result
 
         field = a.get("category_field")
-        if field:
+        renderer_name = a.get("renderer", "single")
+        if renderer_name == "rule_based":
+            rules = a.get("rules") or []
+            if not rules:
+                raise ValueError("rule_based renderer requires nonempty rules")
+            renderer = QgsRuleBasedRenderer(symbol())
+            root = renderer.rootRule()
+            for child in list(root.children()):
+                root.removeChild(child)
+            available = {field.name() for field in layer.fields()}
+            for rule in rules:
+                expression = QgsExpression(rule["expression"])
+                if expression.hasParserError():
+                    raise ValueError(expression.parserErrorString())
+                missing = set(expression.referencedColumns()) - available
+                if missing:
+                    raise ValueError(f"Rule expression references unknown fields: {sorted(missing)}")
+                root.appendChild(QgsRuleBasedRenderer.Rule(
+                    symbol(rule), 0, 0, rule["expression"], rule["label"],
+                ))
+        elif field:
             if layer.fields().indexFromName(field) < 0 or not a.get("categories"):
                 raise ValueError("Provide an existing category_field and nonempty categories")
             categories = [
                 QgsRendererCategory(
-                    c["value"], symbol(color(c["color"])), str(c.get("label", c["value"]))
+                    c["value"], symbol(c), str(c.get("label", c["value"]))
                 )
                 for c in a["categories"]
             ]
             renderer = QgsCategorizedSymbolRenderer(field, categories)
         else:
-            renderer = QgsSingleSymbolRenderer(symbol(fill))
+            renderer = QgsSingleSymbolRenderer(symbol())
         if a.get("label_field"):
             field = a["label_field"]
             if layer.fields().indexFromName(field) < 0:
@@ -568,10 +703,13 @@ class Engine:
         if a.get("action") == "ramps":
             return {"ramps": sorted(QgsStyle.defaultStyle().colorRampNames())}
         if a.get("action") == "help":
-            algorithm = registry.algorithmById(a.get("algorithm") or "")
+            algorithm_id = (a.get("algorithm") or "").strip()
+            if algorithm_id in self._algorithm_help_cache:
+                return self._algorithm_help_cache[algorithm_id]
+            algorithm = registry.algorithmById(algorithm_id)
             if not algorithm:
                 raise ValueError("Unknown algorithm ID")
-            return {
+            result = {
                 "id": algorithm.id(),
                 "name": algorithm.displayName(),
                 "help": algorithm.shortHelpString(),
@@ -581,26 +719,150 @@ class Engine:
                     for p in algorithm.outputDefinitions()
                 ],
             }
-        terms = a.get("query", "").casefold().split()
-        matches = sorted(
-            [
-                {"id": alg.id(), "name": alg.displayName(), "provider": alg.provider().id(),
-                 "group": alg.groupId(), "group_name": alg.group()}
-                for alg in registry.algorithms()
-                if all(term in (alg.id() + " " + alg.displayName() + " " + alg.group()).casefold()
-                       for term in terms)
-                and (not a.get("provider") or alg.provider().id() == a["provider"])
-                and (not a.get("group") or alg.groupId() == a["group"])
-            ],
-            key=lambda x: x["id"],
-        )
-        offset, limit = a.get("offset", 0), a.get("limit", 30)
-        return {
+            self._algorithm_help_cache[algorithm_id] = result
+            return result
+
+        catalog = self.algorithm_catalog(registry)
+        query = " ".join((a.get("query") or "").casefold().split())
+        terms = self.search_terms(query)
+        provider = (a.get("provider") or "").strip().casefold()
+        group = (a.get("group") or "").strip().casefold()
+        cache_key = (query, provider, group)
+        cached = self._algorithm_search_cache.get(cache_key)
+        if cached is None:
+            eligible = [
+                entry for entry in catalog
+                if (not provider or entry["provider"].casefold() == provider)
+                and (not group or entry["group"].casefold() == group)
+            ]
+            matches = [entry for entry in eligible if all(term in entry["_search"] for term in terms)]
+            matches.sort(key=lambda entry: self.algorithm_rank(entry, query, terms))
+            suggestions = []
+            suggested_terms = {}
+            if terms and not matches:
+                suggestions, suggested_terms = self.algorithm_suggestions(eligible, terms)
+            cached = (matches, suggestions, suggested_terms)
+            self._algorithm_search_cache[cache_key] = cached
+            self._algorithm_search_cache.move_to_end(cache_key)
+            while len(self._algorithm_search_cache) > 128:
+                self._algorithm_search_cache.popitem(last=False)
+        else:
+            self._algorithm_search_cache.move_to_end(cache_key)
+
+        matches, suggestions, suggested_terms = cached
+        offset, limit = a.get("offset", 0), a.get("limit", 12)
+        result = {
             "total": len(matches),
-            "algorithms": matches[offset : offset + limit],
+            "algorithms": [self.public_algorithm(entry) for entry in matches[offset : offset + limit]],
             "offset": offset,
             "next_offset": offset + limit if offset + limit < len(matches) else None,
+            "match_mode": "all_terms",
         }
+        if suggestions:
+            result.update(
+                suggestions=[self.public_algorithm(entry) for entry in suggestions[: min(limit, 5)]],
+                suggested_terms=suggested_terms,
+                next_action=(
+                    "No algorithm matched every query term. Choose a returned suggestion only if its "
+                    "name and provider match the requested operation, or retry once with fewer/corrected "
+                    "keywords; do not execute a suggestion automatically."
+                ),
+            )
+        return result
+
+    @staticmethod
+    def search_terms(value):
+        """Normalize model-supplied keywords without changing their semantics."""
+        return tuple(dict.fromkeys(re.findall(r"[^\W_]+", value, flags=re.UNICODE)))
+
+    @staticmethod
+    def public_algorithm(entry):
+        return {key: entry[key] for key in ("id", "name", "provider", "group", "group_name")}
+
+    def algorithm_catalog(self, registry):
+        if self._algorithm_catalog is not None:
+            return self._algorithm_catalog
+        catalog = []
+        for algorithm in registry.algorithms():
+            try:
+                tags = algorithm.tags() or []
+            except (AttributeError, TypeError):
+                tags = []
+            provider = algorithm.provider()
+            entry = {
+                "id": algorithm.id(),
+                "name": algorithm.displayName(),
+                "provider": provider.id(),
+                "group": algorithm.groupId(),
+                "group_name": algorithm.group(),
+            }
+            search_parts = [
+                entry["id"], entry["name"], entry["provider"],
+                provider.name(), entry["group"], entry["group_name"], *tags,
+            ]
+            entry["_search"] = " ".join(str(part) for part in search_parts if part).casefold()
+            entry["_tokens"] = set(self.search_terms(entry["_search"]))
+            catalog.append(entry)
+        self._algorithm_catalog = tuple(catalog)
+        return self._algorithm_catalog
+
+    @staticmethod
+    def algorithm_rank(entry, query, terms):
+        algorithm_id = entry["id"].casefold()
+        short_id = algorithm_id.partition(":")[2]
+        name = entry["name"].casefold()
+        words = entry["_tokens"]
+        if query == algorithm_id:
+            tier = 0
+        elif query == short_id:
+            tier = 1
+        elif query == name:
+            tier = 2
+        elif query and query in algorithm_id:
+            tier = 3
+        elif query and query in name:
+            tier = 4
+        elif terms and all(term in words for term in terms):
+            tier = 5
+        elif terms and all(any(word.startswith(term) for word in words) for term in terms):
+            tier = 6
+        else:
+            tier = 7
+        return tier, len(algorithm_id), algorithm_id
+
+    def algorithm_suggestions(self, eligible, terms):
+        """Return bounded candidates for a failed search, never an executable choice."""
+        vocabulary = sorted({token for entry in eligible for token in entry["_tokens"]})
+        corrected = {}
+        for term in terms:
+            if any(term in entry["_search"] for entry in eligible):
+                continue
+            close = sorted(
+                (
+                    (SequenceMatcher(None, term, token).ratio(), token)
+                    for token in vocabulary
+                    if abs(len(token) - len(term)) <= max(3, len(term) // 2)
+                ),
+                reverse=True,
+            )
+            choices = [token for ratio, token in close[:3] if ratio >= 0.72]
+            if choices:
+                corrected[term] = choices
+        usable_terms = {
+            term for term in terms if any(term in entry["_search"] for entry in eligible)
+        }
+        usable_terms.update(choice for choices in corrected.values() for choice in choices[:1])
+        candidates = [
+            entry for entry in eligible
+            if usable_terms and any(term in entry["_search"] for term in usable_terms)
+        ]
+        candidates.sort(
+            key=lambda entry: (
+                -sum(term in entry["_search"] for term in usable_terms),
+                self.algorithm_rank(entry, " ".join(terms), terms),
+            )
+        )
+        return candidates[:5], corrected
 
     def prepare_processing(self, a):
         alg = QgsApplication.processingRegistry().algorithmById(a["algorithm"])
@@ -626,15 +888,16 @@ class Engine:
             if key not in params or definition.isDestination():
                 continue
             if definition.type() in {"source", "vector", "raster", "maplayer", "multilayer"}:
+                layer_type = definition.type()
 
-                def resolve_id(v):
+                def resolve_id(v, layer_type=layer_type):
                     if not isinstance(v, str):
                         return v
                     layer = self.project.mapLayer(v)
                     if layer is not None:
                         return layer
                     if is_grass:
-                        return self.grass_input_layer(v, definition.type())
+                        return self.grass_input_layer(v, layer_type)
                     return v
 
                 params[key] = (
@@ -823,14 +1086,6 @@ class Engine:
         )
         if not layers:
             raise ValueError("A map needs at least one layer")
-        for layer in layers:
-            stem = Path(layer.source().split("|", 1)[0]).stem
-            generated_name = re.fullmatch(
-                re.escape(stem) + r"_[0-9a-f]{8}(?:_[0-9a-f]{4}){3}_[0-9a-f]{12}",
-                layer.name(), re.IGNORECASE,
-            )
-            if layer.name() == stem or generated_name:
-                layer.setName(stem.replace("_", " ").capitalize())
         target = crs(a["crs"]) if a.get("crs") else layers[0].crs()
         if a.get("extent"):
             extent = QgsRectangle(*a["extent"])
@@ -852,21 +1107,188 @@ class Engine:
         layout = QgsPrintLayout(self.project)
         layout.initializeDefaults()
         layout.setName(name)
-        width, height = a.get("width_mm", 210), a.get("height_mm", 297)
-        outside = a.get("map_element_placement") == "outside"
-        outside_bottom = outside and extent.height() > extent.width() * 1.3
-        if outside_bottom and "width_mm" not in a:
-            width = min(width, max(135, 24 + (height - 110) * extent.width() / extent.height()))
+        requested_elements = a.get("map_elements") or {}
+        thematic_layers = [
+            layer_item for layer_item in layers
+            if layer_item.providerType() != "wms"
+            and not layer_item.customProperty("smart_qgis/basemap", False)
+        ]
+
+        def usable_inside_anchors():
+            """Find genuinely empty thematic corners; basemap pixels never count as evidence."""
+            if not thematic_layers:
+                return []
+            settings = QgsMapSettings()
+            settings.setLayers(thematic_layers)
+            settings.setDestinationCrs(target)
+            settings.setExtent(extent)
+            settings.setOutputSize(QSize(160, 160))
+            settings.setBackgroundColor(QColor(0, 0, 0, 0))
+            job = QgsMapRendererParallelJob(settings)
+            job.start()
+            job.waitForFinished()
+            image = job.renderedImage()
+            windows = {
+                "top_left": (0, 0, 58, 48),
+                "top_right": (102, 0, 160, 48),
+                "bottom_left": (0, 112, 58, 160),
+                "bottom_right": (102, 112, 160, 160),
+            }
+            scores = {}
+            for anchor, (x0, y0, x1, y1) in windows.items():
+                painted = sum(
+                    1 for y in range(y0, y1) for x in range(x0, x1)
+                    if image.pixelColor(x, y).alpha() > 8
+                )
+                scores[anchor] = painted / max(1, (x1 - x0) * (y1 - y0))
+            # A corner must be mostly transparent, not just lighter than its
+            # neighbors. Preference order keeps legend and scale conventions.
+            preference = {name: index for index, name in enumerate(
+                ("top_right", "bottom_right", "bottom_left", "top_left")
+            )}
+            return sorted(
+                (anchor for anchor, score in scores.items() if score <= 0.50),
+                key=lambda anchor: (scores[anchor], preference[anchor]),
+            )
+
+        def legend_item_count():
+            count = 0
+            for layer_item in thematic_layers:
+                try:
+                    count += max(1, len(layer_item.legendSymbologyItems()))
+                except Exception:
+                    count += 1
+            return max(1, count)
+
+        blank_anchors = usable_inside_anchors()
+        automatic_inside_space = len(blank_anchors) >= 2
+        automatic_legend_items = legend_item_count()
+        defaults = {
+            "title": {"frame": "outside", "anchor": "top"},
+            "legend": {"frame": "inside", "anchor": "top_right"},
+            "scalebar": {"frame": "inside", "anchor": "bottom_right"},
+            "north_arrow": {"frame": "inside", "anchor": "top_left"},
+        }
+        if automatic_inside_space:
+            legend_anchor = next(
+                (item for item in ("top_right", "bottom_left", "top_left", "bottom_right")
+                 if item in blank_anchors), blank_anchors[0]
+            )
+            scale_anchor = next(
+                (item for item in ("bottom_right", "bottom_left", "top_right", "top_left")
+                 if item in blank_anchors and item != legend_anchor), blank_anchors[1]
+            )
+            defaults["legend"]["anchor"] = legend_anchor
+            defaults["scalebar"]["anchor"] = scale_anchor
+            remaining = [item for item in blank_anchors if item not in {legend_anchor, scale_anchor}]
+            if remaining:
+                defaults["north_arrow"]["anchor"] = remaining[0]
+            else:
+                defaults["north_arrow"] = {"frame": "outside", "anchor": "top_left"}
+        # Default placements are evidence-driven.  If thematic data leave a
+        # transparent area, keep required elements inside it.  Otherwise use a
+        # compact bottom row for a short legend, or a right-side column for a
+        # longer one.  Explicit user placements always override this policy.
+        if not automatic_inside_space:
+            if automatic_legend_items <= 3:
+                defaults["legend"] = {"frame": "outside", "anchor": "bottom_left"}
+                defaults["scalebar"] = {"frame": "outside", "anchor": "bottom_right"}
+            else:
+                defaults["legend"] = {"frame": "outside", "anchor": "top_right"}
+                defaults["scalebar"] = {"frame": "outside", "anchor": "bottom_right"}
+            defaults["north_arrow"] = {"frame": "outside", "anchor": "top_left"}
+
+        def placement(name):
+            requested = requested_elements.get(name) or {}
+            default = defaults[name]
+            return {
+                "frame": requested.get("frame") or default["frame"],
+                "anchor": requested.get("anchor") or default["anchor"],
+            }
+
+        placements = {name: placement(name) for name in defaults}
+        resolved_legend_flow = None
+        resolved_scalebar = None
+        resolved_annotations = None
+        enabled_elements = {
+            "title": a.get("show_title", True),
+            "legend": a.get("legend", True),
+            "scalebar": a.get("scalebar", True),
+            "north_arrow": a.get("north_arrow", False),
+        }
+        outside_names = [
+            name for name, value in placements.items()
+            if enabled_elements[name] and value["frame"] == "outside"
+        ]
+        outside_bottom = any(placements[name]["anchor"].startswith("bottom") for name in outside_names)
+        outside_top = any(placements[name]["anchor"].startswith("top") for name in outside_names)
+        outside_left = any(placements[name]["anchor"].endswith("left") or placements[name]["anchor"] == "left"
+                           for name in outside_names)
+        outside_right = any(placements[name]["anchor"].endswith("right") or placements[name]["anchor"] == "right"
+                            for name in outside_names)
+        # A fixed A4 page makes near-square thematic layers look like small
+        # thumbnails when a title or outside elements reserve a narrow band.
+        # Size an automatic page around the real data ratio instead. The map
+        # keeps its geographic aspect and full extent; only unused paper moves.
+        extent_ratio = extent.width() / extent.height()
+        orientation = a.get("page_orientation", "auto")
+        requested_orientation = orientation
+        if orientation == "auto":
+            orientation = "landscape" if extent_ratio >= 1.15 else "portrait"
+        left_margin = 12 + (58 if outside_left else 0)
+        right_margin = 12 + (64 if outside_right else 0)
+        top_margin = 28 + (24 if outside_top and placements["title"]["anchor"] != "top" else 0)
+        # A footer is a placement band, not a fixed 45 mm page reservation.
+        bottom_margin = 12 + (32 if outside_bottom else 0)
+        map_frame = a.get("map_frame") or {}
+        frame_mode = map_frame.get("mode", "auto")
+        if frame_mode not in {"auto", "maximize"}:
+            raise ValueError("map_frame.mode must be auto or maximize")
+        if requested_orientation == "auto":
+            if orientation == "landscape":
+                width = 297
+                map_width = width - left_margin - right_margin
+                map_height = map_width / extent_ratio
+                height = top_margin + bottom_margin + map_height
+                # A nearly square wide layer needs a compact near-square page,
+                # rather than a small thumbnail in fixed A4 landscape.
+                if height > 297:
+                    orientation = "portrait"
+                    height = 297
+                    map_height = height - top_margin - bottom_margin
+                    map_width = map_height * extent_ratio
+                    width = map_width + left_margin + right_margin
+            else:
+                # Unlike a fixed A4 portrait page, a compact portrait page
+                # keeps a square or tall thematic frame dominant instead of
+                # leaving a long, unused lower strip.
+                map_height = 240
+                map_width = map_height * extent_ratio
+                width = map_width + left_margin + right_margin
+                height = top_margin + bottom_margin + map_height
+        elif orientation == "landscape":
+            width, height = 297, 210
+            map_width, map_height = None, None
+        else:
+            width, height = 210, 297
+            map_width, map_height = None, None
+        if width < 100 or height < 100 or width > 1000 or height > 1000:
+            raise ValueError("Automatic page size is outside supported layout bounds")
         layout.pageCollection().pages()[0].setPageSize(QgsLayoutSize(width, height))
         layout.renderContext().setDpi(150)
-        frame_width = width - (76 if outside and not outside_bottom else 24)
-        frame_height = height - (110 if outside_bottom else 60)
-        if extent.width() / extent.height() >= frame_width / frame_height:
+        frame_width = width - left_margin - right_margin
+        frame_height = height - top_margin - bottom_margin
+        if frame_width <= 20 or frame_height <= 20:
+            raise ValueError("Requested outside map-element placements leave no usable map frame")
+        if map_width is not None and map_height is not None:
+            map_width = min(map_width, frame_width)
+            map_height = min(map_height, frame_height)
+        elif extent.width() / extent.height() >= frame_width / frame_height:
             map_width, map_height = frame_width, frame_width * extent.height() / extent.width()
         else:
             map_width, map_height = frame_height * extent.width() / extent.height(), frame_height
-        map_x = 12 + (frame_width - map_width) / 2
-        map_y = 28 + (frame_height - map_height) / 2
+        map_x = left_margin + (frame_width - map_width) / 2
+        map_y = top_margin + (frame_height - map_height) / 2
         map_item = QgsLayoutItemMap(layout)
         map_item.setId("main-map")
         layout.addLayoutItem(map_item)
@@ -877,6 +1299,39 @@ class Engine:
         map_item.setKeepLayerSet(True)
         map_item.zoomToExtent(extent)
         map_item.setFrameEnabled(True)
+        map_item.setCustomProperty(
+            "smart-qgis:page-coverage", round((map_width * map_height) / (width * height), 4)
+        )
+
+        def position_for(name, item_width, item_height):
+            choice = placements[name]
+            anchor = choice["anchor"]
+            inside = choice["frame"] == "inside"
+            if inside:
+                x_left, x_right = map_x + 4, map_x + map_width - item_width - 4
+                y_top, y_bottom = map_y + 4, map_y + map_height - item_height - 4
+                x_center, y_center = map_x + (map_width - item_width) / 2, map_y + (map_height - item_height) / 2
+            else:
+                x_left, x_right = 12, width - item_width - 12
+                y_top = 8 if name == "title" or anchor == "top" else map_y
+                y_bottom = map_y + map_height + 8
+                x_center, y_center = (width - item_width) / 2, map_y + (map_height - item_height) / 2
+            x = x_left if anchor.endswith("left") or anchor == "left" else (
+                x_right if anchor.endswith("right") or anchor == "right" else x_center
+            )
+            y = y_top if anchor.startswith("top") or anchor == "top" else (
+                y_bottom if anchor.startswith("bottom") or anchor == "bottom" else y_center
+            )
+            return x, y
+
+        def place(item, name, fallback_width, fallback_height):
+            size = item.sizeWithUnits()
+            item_width = max(fallback_width, size.width())
+            item_height = max(fallback_height, size.height())
+            item.attemptMove(QgsLayoutPoint(*position_for(name, item_width, item_height)))
+            item.setCustomProperty("smart-qgis:frame", placements[name]["frame"])
+            item.setCustomProperty("smart-qgis:anchor", placements[name]["anchor"])
+            return item
 
         def label(text, x, y, w, h, size):
             item = QgsLayoutItemLabel(layout)
@@ -891,11 +1346,31 @@ class Engine:
             return item
 
         if a.get("show_title", True):
-            title_item = label(a.get("title") or name, 12, 8, width - 24, 15,
+            title_width = (
+                max(20, map_width - 8)
+                if placements["title"]["frame"] == "inside"
+                else width - 24
+            )
+            title_item = label(a.get("title") or name, 12, 8, title_width, 15,
                                min(18, max(11, round(width / 12))))
             title_item.setId("map-title")
+            title_anchor = placements["title"]["anchor"]
+            title_item.setHAlign(
+                Qt.AlignmentFlag.AlignLeft
+                if title_anchor.endswith("left") or title_anchor == "left"
+                else Qt.AlignmentFlag.AlignRight
+                if title_anchor.endswith("right") or title_anchor == "right"
+                else Qt.AlignmentFlag.AlignHCenter
+            )
+            place(title_item, "title", min(title_width, 90), 15)
         if a.get("grid", True):
             grid_reference = crs(a.get("grid_crs") or "EPSG:4326")
+            annotation_options = a.get("coordinate_annotations") or {}
+            annotation_format = annotation_options.get("format", "auto")
+            if annotation_format in {"degree_minute", "degree_minute_second"} and not grid_reference.isGeographic():
+                raise ValueError("Degree-based coordinate labels require a geographic annotation CRS")
+            if annotation_options.get("cardinal_directions") is True and not grid_reference.isGeographic():
+                raise ValueError("E/W/N/S coordinate suffixes require a geographic annotation CRS")
             grid = QgsLayoutItemMapGrid("Coordinate annotations", map_item)
             map_item.grids().addGrid(grid)
             grid.setEnabled(True)
@@ -903,31 +1378,75 @@ class Engine:
             grid_extent = QgsCoordinateTransform(
                 target, grid_reference, self.project
             ).transformBoundingBox(map_item.extent())
-            span = max(grid_extent.width(), grid_extent.height()) / 5
+            density_divisor = {
+                "auto": 5, "dense": 8, "sparse": 3,
+            }[annotation_options.get("density", "auto")]
+            span = max(grid_extent.width(), grid_extent.height()) / density_divisor
             power = 10 ** math.floor(math.log10(span))
             interval = next((n * power for n in (1, 2, 5, 10) if n * power >= span), 10 * power)
             grid.setIntervalX(interval)
             grid.setIntervalY(interval)
-            grid.setStyle(QgsLayoutItemMapGrid.FrameAnnotationsOnly)
+            grid.setStyle(
+                QgsLayoutItemMapGrid.Solid
+                if annotation_options.get("grid_lines", False)
+                else QgsLayoutItemMapGrid.FrameAnnotationsOnly
+            )
             grid.setFrameStyle(QgsLayoutItemMapGrid.ExteriorTicks)
             grid.setAnnotationEnabled(True)
-            grid.setAnnotationFormat(QgsLayoutItemMapGrid.Decimal)
-            grid.setAnnotationPrecision(1)
+            suffixes = annotation_options.get("cardinal_directions")
+            annotation_formats = {
+                ("auto", False): QgsLayoutItemMapGrid.Decimal,
+                ("auto", True): QgsLayoutItemMapGrid.DecimalWithSuffix,
+                ("decimal", False): QgsLayoutItemMapGrid.Decimal,
+                ("decimal", True): QgsLayoutItemMapGrid.DecimalWithSuffix,
+                ("degree_minute", False): QgsLayoutItemMapGrid.DegreeMinuteNoSuffix,
+                ("degree_minute", True): QgsLayoutItemMapGrid.DegreeMinute,
+                ("degree_minute_second", False): QgsLayoutItemMapGrid.DegreeMinuteSecondNoSuffix,
+                ("degree_minute_second", True): QgsLayoutItemMapGrid.DegreeMinuteSecond,
+            }
+            show_suffixes = bool(suffixes) if suffixes is not None else False
+            grid.setAnnotationFormat(annotation_formats[(annotation_format, show_suffixes)])
+            precision = annotation_options.get("precision")
+            grid.setAnnotationPrecision(1 if precision is None else precision)
             grid_format = QgsTextFormat()
             grid_format.setFont(QFont("Arial", 8))
             grid_format.setSize(8)
             grid.setAnnotationTextFormat(grid_format)
-            if grid_reference.isGeographic():
-                for side in (QgsLayoutItemMapGrid.Top, QgsLayoutItemMapGrid.Bottom):
-                    grid.setAnnotationDisplay(QgsLayoutItemMapGrid.LongitudeOnly, side)
-                for side in (QgsLayoutItemMapGrid.Left, QgsLayoutItemMapGrid.Right):
-                    grid.setAnnotationDisplay(QgsLayoutItemMapGrid.LatitudeOnly, side)
-            if a.get("legend", True):
-                grid.setAnnotationDisplay(QgsLayoutItemMapGrid.HideAll, QgsLayoutItemMapGrid.Right)
+            sides = set(annotation_options.get("sides") or
+                        ("top", "bottom", "left", "right"))
+            for side_name, side, display in (
+                ("top", QgsLayoutItemMapGrid.Top, QgsLayoutItemMapGrid.LongitudeOnly),
+                ("bottom", QgsLayoutItemMapGrid.Bottom, QgsLayoutItemMapGrid.LongitudeOnly),
+                ("left", QgsLayoutItemMapGrid.Left, QgsLayoutItemMapGrid.LatitudeOnly),
+                ("right", QgsLayoutItemMapGrid.Right, QgsLayoutItemMapGrid.LatitudeOnly),
+            ):
+                grid.setAnnotationDisplay(display if side_name in sides else QgsLayoutItemMapGrid.HideAll, side)
+            resolved_annotations = {
+                "crs": grid_reference.authid(),
+                "format": annotation_format,
+                "precision": 1 if precision is None else precision,
+                "cardinal_directions": show_suffixes,
+                "density": annotation_options.get("density", "auto"),
+                "interval": interval,
+                "grid_lines": annotation_options.get("grid_lines", False),
+                "sides": sorted(sides),
+            }
         if a.get("legend", True):
             legend = QgsLayoutItemLegend(layout)
             map_title = a.get("title") or name
-            legend.setTitle("图例" if re.search(r"[\u4e00-\u9fff]", map_title) else "Legend")
+            map_language = a.get("map_language", "auto")
+            if map_language not in {"auto", "zh", "en"}:
+                raise ValueError("map_language must be auto, zh or en")
+            use_chinese = map_language == "zh" or (
+                map_language == "auto" and bool(re.search(r"[\u4e00-\u9fff]", map_title))
+            )
+            if a.get("show_legend_title", True):
+                legend.setTitle(
+                    a.get("legend_title")
+                    or ("图例" if use_chinese else "Legend")
+                )
+            else:
+                legend.setTitle("")
             legend.setLinkedMap(map_item)
             if hasattr(Qgis, "LegendSyncMode"):
                 legend.setSyncMode(Qgis.LegendSyncMode.Manual)
@@ -943,22 +1462,35 @@ class Engine:
                             and re.fullmatch(r"Band \d+(?: \([^)]*\))?", str(legend_nodes[0].data(0)))):
                         QgsMapLayerLegendUtils.setLegendNodeUserLabel(node, 0, " ")
                         legend.model().refreshLayerLegend(node)
+            legend_flow = (requested_elements.get("legend") or {}).get("flow", "auto")
+            if legend_flow == "horizontal" or (
+                legend_flow == "auto"
+                and placements["legend"] == {"frame": "outside", "anchor": "bottom_left"}
+                and automatic_legend_items <= 3
+            ):
+                legend.setColumnCount(automatic_legend_items)
+            elif legend_flow == "vertical":
+                legend.setColumnCount(1)
+            resolved_legend_flow = legend_flow
             layout.addLayoutItem(legend)
             legend.adjustBoxSize()
-            # QGIS may expand the legend only at render time. Reserve a stable
-            # upper-right inset instead of positioning from its premature size.
-            legend.attemptMove(QgsLayoutPoint(
-                12 if outside_bottom else (width - 60 if outside else max(map_x + 4, map_x + map_width - 70)),
-                map_y + map_height + 8 if outside_bottom else (34 if outside else map_y + 4),
-            ))
+            legend.setId("map-legend")
+            place(legend, "legend", 55, 28)
             legend.setBackgroundEnabled(True)
             legend.setBackgroundColor(QColor(255, 255, 255, 230))
+            legend_border = (requested_elements.get("legend") or {}).get("border")
+            legend.setFrameEnabled(False if legend_border is None else legend_border)
         if a.get("scalebar", True):
             scale = QgsLayoutItemScaleBar(layout)
-            scale.setStyle("Single Box")
+            scale_options = requested_elements.get("scalebar") or {}
+            scale_styles = {
+                "single_box": "Single Box",
+                "double_box": "Double Box",
+                "line_ticks_middle": "Line Ticks Middle",
+            }
+            scale.setStyle(scale_styles[scale_options.get("style", "single_box")])
             scale.setLinkedMap(map_item)
             scale.applyDefaultSize()
-            scale.setUnits(QgsUnitTypes.DistanceKilometers)
             map_extent = map_item.extent()
             if target.isGeographic():
                 width_km = (map_extent.width() * 111.32
@@ -967,26 +1499,41 @@ class Engine:
                 width_km = (map_extent.width() * QgsUnitTypes.fromUnitToUnitFactor(
                     target.mapUnits(), QgsUnitTypes.DistanceKilometers
                 ))
-            scale.setUnitsPerSegment(float(f"{max(width_km / 10, 0.000001):.2g}"))
-            scale.setUnitLabel("km")
+            requested_units = scale_options.get("units", "auto")
+            if requested_units == "auto":
+                requested_units = "meters" if width_km < 1 else "kilometers"
+            unit_options = {
+                "meters": (QgsUnitTypes.DistanceMeters, "m", width_km * 1000),
+                "kilometers": (QgsUnitTypes.DistanceKilometers, "km", width_km),
+                "miles": (QgsUnitTypes.DistanceMiles, "mi", width_km / 1.609344),
+            }
+            scale_units, unit_label, width_in_units = unit_options[requested_units]
+            scale.setUnits(scale_units)
+            scale.setUnitsPerSegment(float(f"{max(width_in_units / 10, 0.000001):.2g}"))
+            scale.setUnitLabel(unit_label)
             scale.setNumberOfSegments(2)
             scale.setNumberOfSegmentsLeft(0)
+            resolved_scalebar = {
+                "units": requested_units,
+                "style": scale_options.get("style", "single_box"),
+            }
             layout.addLayoutItem(scale)
             scale.refresh()
-            scale.attemptMove(QgsLayoutPoint(
-                width - 50 if outside_bottom else (width - 60 if outside else map_x + 4),
-                map_y + map_height + 12 if outside_bottom else (height - 52 if outside else map_y + map_height - 20),
-            ))
-        if outside_bottom and "height_mm" not in a and len(layers) == 1:
-            footer_bottom = map_y + map_height
-            if a.get("legend", True):
-                footer_bottom = max(footer_bottom,
-                                    legend.positionWithUnits().y() + legend.sizeWithUnits().height())
-            if a.get("scalebar", True):
-                footer_bottom = max(footer_bottom,
-                                    scale.positionWithUnits().y() + scale.sizeWithUnits().height())
-            height = min(height, max(footer_bottom + 12, map_y + map_height + 24))
-            layout.pageCollection().pages()[0].setPageSize(QgsLayoutSize(width, height))
+            scale.setId("map-scalebar")
+            place(scale, "scalebar", 42, 8)
+        if a.get("north_arrow", False):
+            arrow_path = next((
+                str(path) for root in QgsApplication.svgPaths()
+                for path in Path(root).glob("**/*NorthArrow*.svg")
+            ), None)
+            if arrow_path is None:
+                raise ValueError("QGIS north-arrow SVG is unavailable")
+            north_arrow = QgsLayoutItemPicture(layout)
+            north_arrow.setPicturePath(arrow_path)
+            north_arrow.setId("map-north-arrow")
+            layout.addLayoutItem(north_arrow)
+            north_arrow.attemptResize(QgsLayoutSize(14, 14))
+            place(north_arrow, "north_arrow", 14, 14)
         attribution = " · ".join(
             dict.fromkeys(
                 layer_item.serverProperties().attribution()
@@ -1005,8 +1552,23 @@ class Engine:
             "layers": [layer_item.id() for layer_item in layers],
             "width_mm": width,
             "height_mm": height,
-            "map_element_placement": "outside" if outside else "inside",
-            "map_element_area": "bottom" if outside_bottom else ("right" if outside else "inside"),
+            "page_orientation": orientation,
+            "map_frame_mode": frame_mode,
+            "map_frame_page_coverage": map_item.customProperty("smart-qgis:page-coverage"),
+            "resolved_element_placements": {
+                name: placements[name] for name, enabled in enabled_elements.items() if enabled
+            },
+            "legend_layer_names": [
+                layer_item.name() for layer_item in layers if layer_item.providerType() != "wms"
+            ],
+            "legend_flow": resolved_legend_flow,
+            "legend_border": (
+                False
+                if (requested_elements.get("legend") or {}).get("border") is None
+                else (requested_elements.get("legend") or {}).get("border")
+            ) if a.get("legend", True) else None,
+            "scalebar": resolved_scalebar,
+            "coordinate_annotations": resolved_annotations,
         }
 
     def export_map(self, a):

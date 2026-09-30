@@ -37,20 +37,38 @@ Create/open replaces current project state. Mutating calls are serialized, not t
 Only claim success after tools report success. No task contracts or recovery are provided.
 Reasoning and model selection belong to the calling agent, not this server."""
 
-RELIABLE_INSTRUCTIONS = """Smart-QGIS is a headless durable GIS execution service. The host owns all reasoning.
-For a new request call task_start once with the original goal, absolute-path inputs and declared deliverables. Input kind is optional: the service inspects every vector/raster input and determines its actual kind before locking the task contract. Keep contract={} unless the user explicitly requested extra acceptance checks.
-For a standard map/layout/export/editable-project request, task_start returns task_execute_next. Call it with no arguments; the service owns the current action handle, workflow selection, approved parameters, execution, final validation and completion. Do not rediscover another tool or repeat approved arguments.
-Standard maps contain a title, legend, scale bar and coordinate annotations unless the user's explicit contract omits an element. The workflow retains strict per-step validation and a checkpoint after every internal step.
-For Processing, determine the exact installed algorithm ID (use algorithm_info list only for discovery, and help only when parameter semantics or expression syntax must be understood), then call prepare_algorithm once. It always reads live QGIS parameter help, mechanically corrects unambiguous parameter-name case and JSON type/enum representations before the step contract, binds declared assets and outputs, applies documented defaults, and returns typed questions only for unresolved required values. Put layer/source bindings in inputs, destinations in outputs, and known bands/numbers/enums/CRS/expressions in parameters. Omit unknown required values; never guess them.
-For a pre-decomposed controlled workflow, task_start may include a frozen plan of exact algorithm IDs, logical bindings and known parameter values. Call task_execute_next with no arguments; the service validates and executes the plan step by step. A missing required value returns a structured question instead of being guessed.
-After an MCP restart, call task_recover with the existing task_id before any other task mutation. Then call task_execute_next with no arguments when an action is pending. task_diagnose is read-only diagnosis after reconnect, a lost response or an error; it does not re-execute. After any thinking or tool timeout, stop and ask the user for guidance; for a tool timeout, use task_diagnose first, record the real guidance with task_record_guidance or task_answer, then call task_recover. Use task_answer only after presenting a required question to the user and receiving the actual answer. When correction or semantic repair reaches the configured limit, ask the user and record their actual guidance with task_record_guidance before continuing the same task.
-Never invent task IDs, versions, idempotency keys or parameter values. Machine continuation and action tokens are owned by the service and are intentionally absent from the compact MCP schema. Missing required choices with no documented or data-derived default must be asked, not guessed.
-The MCP tools advertised in this session are the complete callable surface. Never search for, infer, or invoke an unadvertised tool name; when a required host capability is absent, state the exact user question and stop the turn.
-Reliable mode intentionally hides direct mutation and low-level lifecycle tools. Internally, every operation still passes the same task contract, parameter preflight, basic output checks, durable journal and checkpoint path.
-If a Processing step fails before commit, use prepare_algorithm with repairs_step naming the failed step. If a committed result is wrong or unusable, call task_invalidate on its producer first, then prepare_algorithm with repairs_step and the original logical output ID. Do not overwrite a still-committed asset.
-Only claim completion when task_execute_next returns COMPLETED; missing or unverified required checks block completion.
-Do not add analysis or reprojection steps the user did not request merely because a CRS has no authority ID; a passed crs_valid check may represent a valid custom CRS, and QGIS layouts transform valid layers on the fly.
+RELIABLE_INSTRUCTIONS = """Smart-QGIS is a headless durable GIS service; the client owns reasoning and user dialogue.
+Call task_start once with the original goal, absolute inputs and requested deliverables. Input kind may be omitted for inspection. Set overwrite_existing_outputs=true when the user explicitly authorized replacing files at those declared paths; the server also honors an unambiguous original instruction such as “同名文件请直接覆盖”. Otherwise omit it. Keep contract={} except for explicit extra acceptance requirements. Standard workflows and frozen plans return no-argument task_execute; call it without rediscovery or copied internal state.
+For general Processing, identify one exact installed algorithm ID, using algorithm_info only when discovery/help is needed. Then call prepare_algorithm once with layer bindings in inputs, destinations in outputs and only known scalar/band/enum/CRS/expression values in parameters. It reads live help, normalizes representation, applies documented defaults and runs native preflight. Missing required semantic values become questions; never guess them.
+Use exact identifiers returned by project_info/data_info. Services, styles, project/layer changes and copy-on-write vector edits follow their published schemas; never invent endpoints, credentials, fields, bands or layer names. A basemap never controls thematic extent. Standard maps keep title, legend, scale bar and coordinate annotations unless explicitly omitted; north arrow is opt-in.
+Use task_answer only for the user's actual answer and task_update only for actual later instructions. task_diagnose is read-only. After restart/lost attachment use task_resume with the same task ID; use task_restart for a user-authorized failed operation, analysis or map rebuild. After timeout or the correction limit, stop automatic retries and obtain real guidance. Never expose or invent internal steps, versions, keys or tokens.
+On OUTPUT_EXISTS ask about that exact file. Prefer task_update.output_conflict action=overwrite with the matching public decision_calls arguments. A clear actual user approval such as “同名文件请直接覆盖” is also safely bound by the server to that one pending path; vague references are rejected. A valid task_update automatically resumes only the failed operation and returns task_execute; never delete the file with another tool. Advertised tools are the complete callable surface: do not search for unadvertised names. Claim success only when task_execute returns COMPLETED and required outputs/checks pass. Do not add unrequested analysis or reprojection merely because a valid CRS lacks an authority ID.
 """ + MINIMUM_ACCEPTANCE_POLICY + "\n" + PARAMETER_HELP_POLICY
+
+
+def compact_published_schema(schema):
+    """Remove generated prose that costs context but changes no validation rule."""
+
+    def visit(value, path=()):
+        if isinstance(value, dict):
+            result = {}
+            for key, child in value.items():
+                if key == "title" and (not path or path[-1] != "properties"):
+                    continue
+                if key == "description" and (
+                    not path or (len(path) >= 2 and path[-2] == "$defs")
+                ):
+                    # Tool descriptions explain the root purpose.  Pydantic
+                    # class docstrings repeat that purpose inside $defs; field
+                    # descriptions remain intact because they guide arguments.
+                    continue
+                result[key] = visit(child, (*path, key))
+            return result
+        if isinstance(value, list):
+            return [visit(child, path) for child in value]
+        return value
+
+    return visit(schema)
 
 
 def make_server(bridge, *, compact_tools=None):
@@ -63,7 +81,10 @@ def make_server(bridge, *, compact_tools=None):
         tool.name: tool
         for tool in build_tools(bridge, compact=compact)
     }
-    schemas = {name: tool.args_schema.model_json_schema() for name, tool in registry.items()}
+    schemas = {
+        name: compact_published_schema(tool.args_schema.model_json_schema())
+        for name, tool in registry.items()
+    }
     if compact:
         for schema in schemas.values():
             schema.get("properties", {}).pop("continuation_token", None)
@@ -102,7 +123,15 @@ def make_server(bridge, *, compact_tools=None):
                                           phase="arguments", next_action="tools/list"))
         try:
             if reliable:
-                bridge.correction_gate(name, arguments)
+                # Safe public names intentionally hide only lower-level
+                # recovery and inspection operations. task_execute is the
+                # canonical routed executor throughout reliable mode.
+                operation = {
+                    "task_resume": "task_recover",
+                    "project_info": "project",
+                    "data_info": "inspect_data",
+                }.get(name, name) if compact else name
+                bridge.correction_gate(operation, arguments)
             validators[name].validate(arguments)
             # Do not let ambient LangChain tracing export paths, data or user goals.
             # Reliable mode has a separate explicit, allowlisted event exporter.
@@ -184,7 +213,7 @@ def make_server(bridge, *, compact_tools=None):
             "an editable QGIS project, and PNG/PDF maps titled 陕西省海拔高度空间分布图 "
             "with an elevation legend, scale bar and coordinate graticule. "
             "Call task_start with these inputs and deliverables, keep the contract minimal, "
-            "then call task_execute_next with no arguments. The service inspects inputs and "
+            "then call task_execute with no arguments. The service inspects inputs and "
             "owns the standard workflow. Report the completed task ID and artifacts."
             "\n" + MINIMUM_ACCEPTANCE_POLICY
             + "\n" + PARAMETER_HELP_POLICY

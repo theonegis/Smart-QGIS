@@ -1,0 +1,5 @@
+name: smart-qgis-profile-toggle
+version: 1.0.0
+description: Switch the owner's Weixin DM between the default and Smart-QGIS profiles.
+provides_commands:
+  - smart-qgis

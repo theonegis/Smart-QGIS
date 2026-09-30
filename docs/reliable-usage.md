@@ -5,17 +5,32 @@ Smart-QGIS MCP 默认以 `reliable` 模式运行；`--execution-mode legacy` 是
 ## 调用流程
 
 1. 用 `task_start` 创建任务，提供原始目标、绝对路径输入和所需交付物。输入类型可以由服务端检查；`contract` 默认留空，只写用户明确附加的验收要求。
-2. 标准地图/工程或已给定的处理计划：按响应调用 **无参数** 的 `task_execute_next`。不复制或构造内部 token，不重复提交已批准的 GIS 参数。
-3. 通用 Processing：先确认一个当前安装的精确算法 ID；必要时用 `algorithm_info` 搜索或查看语义，再调用 `prepare_algorithm`。输入图层、输出文件和已知数值/波段/枚举/CRS/表达式分别按公开 schema 提交。服务端读取该算法的实时帮助并做基本参数检查；缺少无默认值的必需语义参数时，返回结构化问题。
-4. 只有收到用户真实回答后才用 `task_answer`。准备完成后继续 `task_execute_next`，直到 `COMPLETED`、需要用户指导或出现明确阻塞。
+2. 标准地图/工程或已给定的处理计划：按响应调用 **无参数** 的 `task_execute`。不复制或构造内部 token，不重复提交已批准的 GIS 参数。
+3. 通用 Processing：先确认一个当前安装的精确算法 ID；必要时用 `algorithm_info` 以 1–3 个关键词和可选 provider/group 过滤搜索。算法目录在 worker 内只建立一次并缓存重复查询，结果按相关性排序且默认最多返回 12 条；无严格匹配时只给出最多 5 个候选，不会自动选择近似算法。确认 ID 后再调用 `prepare_algorithm`。输入图层、输出文件和已知数值/波段/枚举/CRS/表达式分别按公开 schema 提交。服务端读取该算法的实时帮助并做基本参数检查；缺少无默认值的必需语义参数时，返回结构化问题。
+4. 只有收到用户真实回答后才用 `task_answer`。准备完成后继续 `task_execute`，直到 `COMPLETED`、需要用户指导或出现明确阻塞。
 
-公开可靠工具包括 `algorithm_info`、`task_start`、`task_execute_next`、`prepare_algorithm`、`task_answer`、`task_record_guidance`、`task_invalidate`、`task_recover` 和 `task_diagnose`。以运行中的 MCP 工具列表与 schema 为准，不猜测或搜索未暴露的工具名。多步任务按当前步骤逐步发现、准备、执行，不预先猜完所有算法与参数。
+公开可靠工具包括 `project_info`、`data_info`、`algorithm_info`、`task_start`、`task_execute`、`prepare_algorithm`、`task_answer`、`task_update`、`task_resume`、`task_diagnose`、`task_restart` 和 `task_stop`。以运行中的 MCP 工具列表与 schema 为准，不猜测或搜索未暴露的工具名。多步任务按当前步骤逐步发现、准备、执行，不预先猜完所有算法与参数。
+
+## 常用工程与数据操作
+
+- `task_start.project` 可使用当前工程、新建工程或打开绝对路径的 `.qgz/.qgs`；保存和另存为通过 `kind="project"` 的交付物完成。`project_update` 只修改工程标题或显示 CRS，不会重投影源数据。
+- `layer_operations` 支持重命名、移除、显示/隐藏、透明度、子集排序和分组。优先使用任务逻辑 ID；已有工程中的图层先用 `project_info` 取得精确 ID 或唯一名称。
+- `data_info.query` 支持最多 100 个要素的只读抽样，以及一个数值字段的统计；可带经过核实的 QGIS 表达式，不会改变选择状态。
+- `services` 可一次声明多个具名 OSM、XYZ、WMS、WMTS 或 WFS 图层。WFS 作为矢量覆盖层加载；服务地址、图层名/要素类型、CRS、样式和 `authcfg` 必须来自用户或服务文档，不由模型猜测。
+- 输出覆盖默认需要确认。用户在初始请求中已明确授权覆盖所有声明的最终路径时，优先设置 `task_start.overwrite_existing_outputs=true`；服务器也会识别原始请求中无歧义的“同名文件请直接覆盖”。否则 `OUTPUT_EXISTS` 会返回公开的 `task_update.output_conflict` 决策模板。结构化决定仍是后续冲突处理的首选；清晰的实际用户答复也只会被绑定到服务端报告的那一个路径。成功后服务器只恢复失败的输出步骤并返回 `task_execute`。
+- 工具名和参数名固定为英文，避免为同一能力暴露两套工具而增加模型的选择成本；用户目标、问答、图名、图例和错误信息支持中文及英文。`map_language=auto|zh|en` 仅控制服务器自动生成的制图文字，默认 `auto` 跟随原始目标或图名。
+- 矢量样式支持单一、分类、分级、规则渲染及已声明 QML；栅格样式支持连续色带、掩膜、灰度、RGB 组合、实时晕渲及已声明 QML。未知字段、波段、规则表达式和分类语义仍应询问用户。
+- `data_operations` 以写时复制方式创建、编辑或导出矢量数据，输出必须声明为 `kind="vector"` 的交付物。更新使用 `data_info` 返回的真实要素 ID，原始文件不会被就地修改。字段计算、连接、几何修复和其他转换继续使用通用 Processing。
+
+完成任务后的工程/服务/图层/数据修改可通过 `task_update` 提交并由无参数 `task_execute` 执行。为了让恢复边界明确，同一次 `task_update` 不混合数据/工程操作与地图版面修订。
+
+单框地图可选 `map_crs` 作为显示投影，源数据不会被改写；坐标标注可独立设置 CRS、标注边、十进制度/度分/度分秒、精度、E/W/N/S、疏密及是否绘制网格线。地图元素仅提供框内/框外与九宫格位置；图例另有横排/竖排及边框开关，比例尺另有常用单位和三种样式。未指定时由服务端按专题数据范围、真实空白区域和图例数量自动排版。图例始终使用当前 QGIS 图层名称，不在制图阶段用源文件名替换。公开 schema 无法表达的显式要求会作为不支持的选项返回，不会猜测相近参数反复尝试。
 
 ## 失败与恢复
 
-`task_diagnose` 只读，不会重试；进程重启后使用原 task ID 调用 `task_recover`。未提交的失败处理步骤可用 `prepare_algorithm(repairs_step=...)` 重交；已提交但经证实错误的结果，先用 `task_invalidate` 失效生产者及下游，再修复并复用原逻辑输出 ID。所有尝试和检查点保留在任务日志中。
+`task_diagnose` 只读，不会重试；进程重启后使用原 task ID 调用 `task_resume`。客户端不传内部步骤或修复标识；由 `task_update` 记录用户的具体修订，或用 `task_restart` 选择失败操作、分析或地图的重启范围。所有尝试和检查点保留在任务日志中。
 
-连续纠错达到上限，或客户端思考/工具调用超时后，停止盲试，展示具体问题并等待用户真实指示。用 `task_record_guidance` 记录后继续原任务，不新建任务掩盖失败。服务端默认纠错上限 3 次、单次 worker 操作超时 900 秒；客户端需自行设置合适的模型思考超时，它不是 MCP 启动参数。
+连续纠错达到上限，或客户端思考/工具调用超时后，停止盲试，展示具体问题并等待用户真实指示。用 `task_update` 记录后继续原任务，不新建任务掩盖失败。服务端默认纠错上限 3 次、单次 worker 操作超时 900 秒；客户端需自行设置合适的模型思考超时，它不是 MCP 启动参数。
 
 ## 最低检查与地图
 

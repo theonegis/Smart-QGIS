@@ -6,7 +6,6 @@ only authoritative success record; files alone never imply success.
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -14,11 +13,18 @@ import re
 import shutil
 import sqlite3
 import sys
+import tempfile
 import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from xml.etree import ElementTree
+
+try:  # POSIX (macOS, Ubuntu and Fedora)
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+    import msvcrt
 
 
 class TaskError(RuntimeError):
@@ -44,13 +50,49 @@ def digest(value):
     return hashlib.sha256(canonical(value).encode()).hexdigest()
 
 
-def state_root():
-    override = os.getenv("SMART_QGIS_STATE_DIR")
+def state_root(*, platform=None, environ=None, home=None):
+    """Return the platform-standard durable journal location."""
+    environ = os.environ if environ is None else environ
+    platform = sys.platform if platform is None else platform
+    home = Path.home() if home is None else Path(home)
+    override = environ.get("SMART_QGIS_STATE_DIR")
     if override:
         return Path(override).expanduser().resolve()
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "smart-qgis"
-    return Path(os.getenv("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "smart-qgis"
+    if platform == "darwin":
+        return home / "Library" / "Application Support" / "smart-qgis"
+    if platform == "win32":
+        local_app_data = environ.get("LOCALAPPDATA") or environ.get("APPDATA")
+        return Path(local_app_data) / "Smart-QGIS" if local_app_data else home / "AppData/Local/Smart-QGIS"
+    return Path(environ.get("XDG_STATE_HOME", home / ".local" / "state")) / "smart-qgis"
+
+
+def temporary_output_root(task_id):
+    """Per-task ephemeral artifacts; durable journals remain under state_root()."""
+    return Path(tempfile.gettempdir()) / "smart-qgis" / identifier(task_id)
+
+
+def _try_lock(lock):
+    if fcntl is not None:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return
+    lock.seek(0)
+    if not lock.read(1):
+        lock.seek(0)
+        lock.write(b"0")
+        lock.flush()
+    lock.seek(0)
+    try:
+        msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError as exc:
+        raise BlockingIOError from exc
+
+
+def _unlock(lock):
+    if fcntl is not None:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+    else:
+        lock.seek(0)
+        msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def identifier(value):
@@ -237,8 +279,10 @@ class TaskStore:
             except OSError:
                 continue
             try:
+                locked = False
                 try:
-                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    _try_lock(lock)
+                    locked = True
                 except BlockingIOError:
                     report["skipped_busy"].append(task_id)
                     continue
@@ -279,16 +323,24 @@ class TaskStore:
                     if connection is not None:
                         connection.close()
                 quarantine = root / f".cleanup-{task_id}-{uuid.uuid4().hex}"
+                # Windows cannot rename a directory while its lock file is open.
+                # The journal was just read under an exclusive lock; release it
+                # immediately before the atomic quarantine rename on every OS.
+                _unlock(lock)
+                locked = False
                 try:
                     os.replace(directory, quarantine)
                 except OSError:
                     continue
             finally:
+                if locked:
+                    _unlock(lock)
                 lock.close()
             try:
                 shutil.rmtree(quarantine)
             except OSError:
                 continue
+            shutil.rmtree(temporary_output_root(task_id), ignore_errors=True)
             report["removed"].append(task_id)
         return report
 
@@ -297,6 +349,7 @@ class TaskStore:
         self.directory = Path(root).resolve() / self.task_id
         self.db = None
         self.lock = None
+        self._locked = False
         if create:
             self.directory.mkdir(parents=True, exist_ok=False, mode=0o700)
         if not self.directory.is_dir() or self.directory.is_symlink():
@@ -304,7 +357,8 @@ class TaskStore:
         try:
             self.lock = (self.directory / "owner.lock").open("a+b")
             try:
-                fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _try_lock(self.lock)
+                self._locked = True
             except BlockingIOError as exc:
                 raise TaskError(
                     "TASK_BUSY", "Another process owns this task", retryable=True
@@ -331,8 +385,8 @@ class TaskStore:
 
     @classmethod
     def create(cls, root, goal, inputs, deliverables, environment):
-        if not goal.strip() or not deliverables:
-            raise TaskError("INVALID_TASK", "A nonempty goal and deliverables are required")
+        if not goal.strip():
+            raise TaskError("INVALID_TASK", "A nonempty goal is required")
         store = cls(root, uuid.uuid4().hex, create=True)
         try:
             with store.transaction():
@@ -358,6 +412,9 @@ class TaskStore:
             self.db.close()
             self.db = None
         if self.lock is not None:
+            if self._locked:
+                _unlock(self.lock)
+                self._locked = False
             self.lock.close()
             self.lock = None
 

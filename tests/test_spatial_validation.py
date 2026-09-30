@@ -234,15 +234,16 @@ async def test_layout_content_rejects_wrong_text_hidden_scale_and_grid(spatial_d
 import json,sys
 sys.path.insert(0,sys.argv[1])
 import worker
-from qgis.core import (QgsLayoutItemLabel,QgsLayoutItemLegend,QgsLayoutItemScaleBar,
+from qgis.PyQt.QtCore import Qt
+from qgis.core import (QgsLayoutItemLabel,QgsLayoutItemLegend,QgsLayoutItemPicture,QgsLayoutItemScaleBar,
                        QgsCoordinateReferenceSystem)
 engine=worker.Engine()
 try:
  layer=engine.load_data({'path':sys.argv[2],'kind':'vector'})
- engine.layout({'name':'Map','layers':[layer['id']],'extent_layer':layer['id'],'title':'Required title'})
+ engine.layout({'name':'Map','layers':[layer['id']],'extent_layer':layer['id'],'title':'Required title','north_arrow':True})
  layout=engine.project.layoutManager().layoutByName('Map')
  request={'check':{'id':'content','kind':'layout_content','target':'map','texts':['Required title'],
-                  'require_title':True,'require_legend':True,'require_scalebar':True,
+                  'require_title':True,'require_legend':True,'require_scalebar':True,'require_north_arrow':True,
                   'require_grid':True,'grid_crs':'EPSG:4326'},'assets':{'map':{'layout':'Map'}}}
  reports={'good':engine.dispatch('_validate',request)}
  title=next(i for i in layout.items() if isinstance(i,QgsLayoutItemLabel) and i.text()=='Required title')
@@ -271,20 +272,44 @@ try:
  engine.layout({'name':'中文地图','layers':[layer['id']],'extent_layer':layer['id']})
  chinese=engine.project.layoutManager().layoutByName('中文地图')
  reports['language']=next(i for i in chinese.items() if isinstance(i,QgsLayoutItemLegend)).title()
+ engine.layout({'name':'强制英文地图','layers':[layer['id']],'extent_layer':layer['id'],
+                'map_language':'en'})
+ english=engine.project.layoutManager().layoutByName('强制英文地图')
+ reports['language_override']=next(i for i in english.items() if isinstance(i,QgsLayoutItemLegend)).title()
  placement=engine.layout({'name':'Outside','layers':[layer['id']],'extent_layer':layer['id'],
-                          'map_element_placement':'outside'})
+                          'map_elements':{'legend':{'frame':'outside','anchor':'bottom_left'},
+                                          'scalebar':{'frame':'outside','anchor':'bottom_right'},
+                                          'north_arrow':{'frame':'inside','anchor':'top_left'}},'north_arrow':True})
  outside=engine.project.layoutManager().layoutByName('Outside')
  outer_map=outside.itemById('main-map')
  outer_legend=next(i for i in outside.items() if isinstance(i,QgsLayoutItemLegend))
  outer_scale=next(i for i in outside.items() if isinstance(i,QgsLayoutItemScaleBar))
- reports['outside_area']=placement['map_element_area']
- reports['outside_width']=placement['width_mm']
- if placement['map_element_area']=='bottom':
-  reports['outside']=(outer_legend.positionWithUnits().y()>=outer_map.positionWithUnits().y()+outer_map.sizeWithUnits().height()
-                       and outer_scale.positionWithUnits().y()>=outer_map.positionWithUnits().y()+outer_map.sizeWithUnits().height())
- else:
-  reports['outside']=(outer_legend.positionWithUnits().x()>=outer_map.positionWithUnits().x()+outer_map.sizeWithUnits().width()
-                       and outer_scale.positionWithUnits().x()>=outer_map.positionWithUnits().x()+outer_map.sizeWithUnits().width())
+ reports['outside']=(outer_legend.positionWithUnits().y()>=outer_map.positionWithUnits().y()+outer_map.sizeWithUnits().height()
+                     and outer_scale.positionWithUnits().y()>=outer_map.positionWithUnits().y()+outer_map.sizeWithUnits().height())
+ reports['placements']=placement['resolved_element_placements']
+ outside_check={'check':{'id':'outside-content','kind':'layout_content','target':'outside',
+                         'require_legend':True,'require_scalebar':True,'require_north_arrow':True,
+                         'element_placements':{'legend':{'frame':'outside','anchor':'bottom_left'},
+                                               'scalebar':{'frame':'outside','anchor':'bottom_right'},
+                                               'north_arrow':{'frame':'inside','anchor':'top_left'}}},
+                'assets':{'outside':{'layout':'Outside'}}}
+ reports['placement_valid']=engine.dispatch('_validate',outside_check)
+ adaptive=engine.layout({'name':'修订地图','layers':[layer['id']],'extent_layer':layer['id'],
+                         'title':'基于 DEM 的崎岖度计算结果制图','legend_title':'地形崎岖度',
+                         'page_orientation':'auto','map_frame':{'mode':'maximize','min_page_coverage':0.55}})
+ revised=engine.project.layoutManager().layoutByName('修订地图')
+ revised_map=revised.itemById('main-map')
+ revised_legend=next(i for i in revised.items() if isinstance(i,QgsLayoutItemLegend))
+ reports['revision']={'title':next(i for i in revised.items() if isinstance(i,QgsLayoutItemLabel) and i.id()=='map-title').text(),
+                      'legend':revised_legend.title(),
+                      'coverage':adaptive['map_frame_page_coverage'],
+                      'orientation':adaptive['page_orientation'],
+                      'map_width':revised_map.sizeWithUnits().width(),
+                      'page_width':adaptive['width_mm']}
+ reports['revision']['title_centered']=next(i for i in revised.items() if isinstance(i,QgsLayoutItemLabel) and i.id()=='map-title').hAlign() == Qt.AlignmentFlag.AlignHCenter
+ reports['revision']['north_arrows']=len([i for i in revised.items() if isinstance(i,QgsLayoutItemPicture) and i.id()=='map-north-arrow'])
+ coverage_check={'check':{'id':'coverage','kind':'layout_content','target':'revised','min_page_coverage':0.55},'assets':{'revised':{'layout':'修订地图'}}}
+ reports['coverage']=engine.dispatch('_validate',coverage_check)
  engine.layout({'name':'Projected','layers':[layer['id']],'extent_layer':layer['id'],
                 'grid_crs':'EPSG:3857'})
  projected={'check':{'id':'projected','kind':'layout_content','target':'projected',
@@ -304,9 +329,19 @@ finally: engine.close()
     geometry = reports.pop("geometry")
     assert reports.pop("inside") == {"legend": True, "scale": True}, geometry
     assert reports.pop("language") == "图例", reports
+    assert reports.pop("language_override") == "Legend", reports
     assert reports.pop("outside"), reports
-    assert reports.pop("outside_area") == "bottom", reports
-    assert reports.pop("outside_width") < 210, reports
+    assert reports.pop("placements")["legend"] == {"frame": "outside", "anchor": "bottom_left"}, reports
+    assert reports.pop("placement_valid")["status"] == "passed", reports
+    revision = reports.pop("revision")
+    assert revision["title"] == "基于 DEM 的崎岖度计算结果制图", revision
+    assert revision["legend"] == "地形崎岖度", revision
+    assert revision["title_centered"], revision
+    assert revision["north_arrows"] == 0, revision
+    assert revision["orientation"] == "portrait", revision
+    assert revision["coverage"] > 0.55, revision
+    assert revision["map_width"] > revision["page_width"] * 0.55, revision
+    assert reports.pop("coverage")["status"] == "passed", reports
     assert reports.pop("good")["status"] == "passed", reports
     assert reports.pop("projected")["status"] == "passed", reports
     assert all(report["status"] == "failed" for report in reports.values()), reports
@@ -890,7 +925,7 @@ print(json.dumps({'alpha':results,'colors':colors,'reference':reference}))
 
 @pytest.mark.parametrize("raster_name", ['source.tif', 'alpha-int16.tif', 'alpha-uint16.tif'])
 async def test_generated_raster_legend_pixels_survive_worker_replacement(spatial_data, raster_name):
-    from PIL import Image
+    from PIL import Image, ImageChops, ImageStat
 
     bridge = QgisBridge(120)
     try:
@@ -908,7 +943,12 @@ async def test_generated_raster_legend_pixels_survive_worker_replacement(spatial
         await bridge.call('export_map', {'layout': 'Map', 'path': str(after), 'dpi': 100})
         with Image.open(before) as a, Image.open(after) as b:
             assert a.size == b.size
-            assert a.convert('RGBA').tobytes() == b.convert('RGBA').tobytes()
+            # QGIS/Qt may vary antialiasing by a few RGB levels across fresh
+            # processes.  Verify visual equivalence instead of byte identity;
+            # a missing legend or renderer would exceed both tight bounds.
+            difference = ImageChops.difference(a.convert('RGB'), b.convert('RGB'))
+            assert max(high for _, high in difference.getextrema()) <= 5
+            assert sum(ImageStat.Stat(difference).mean) < 0.001
     finally:
         await bridge.close()
 
@@ -926,7 +966,8 @@ async def test_mask_raster_uses_one_category_instead_of_numeric_ramp(spatial_dat
         assert styled['mode'] == 'mask'
         await bridge.call('layout', {
             'name': 'Map', 'title': 'Priority area', 'layers': [loaded['id']],
-            'extent_layer': loaded['id'], 'map_element_placement': 'outside',
+            'extent_layer': loaded['id'],
+            'map_elements': {'legend': {'frame': 'outside', 'anchor': 'bottom_left'}},
         })
         checkpoint = await bridge.call('_snapshot', {
             'directory': str(spatial_data / 'mask-checkpoint'),

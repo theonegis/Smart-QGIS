@@ -42,6 +42,28 @@ def test_deliverable_rejects_removed_display_name_field():
         )
 
 
+def test_deliverable_accepts_absolute_file_or_directory_destination(tmp_path):
+    file_target = tmp_path / "maps" / "result.png"
+    folder_target = tmp_path / "exports"
+    file_output = Deliverable.model_validate({
+        "id": "map", "description": "Map", "kind": "image", "path": str(file_target),
+    })
+    folder_output = Deliverable.model_validate({
+        "id": "raster", "description": "Raster", "kind": "raster", "directory": str(folder_target),
+    })
+    assert file_output.path == str(file_target)
+    assert folder_output.directory == str(folder_target)
+    with pytest.raises(ValidationError, match="either path or directory"):
+        Deliverable.model_validate({
+            "id": "bad", "description": "Bad", "kind": "image",
+            "path": str(file_target), "directory": str(folder_target),
+        })
+    with pytest.raises(ValidationError, match="absolute"):
+        Deliverable.model_validate({
+            "id": "bad", "description": "Bad", "kind": "image", "path": "result.png",
+        })
+
+
 def test_agent_contract_is_structured_and_validates_optional_coverage():
     contract = TaskContract.model_validate(body())
     validate_task_contract(contract, deliverables(), {})

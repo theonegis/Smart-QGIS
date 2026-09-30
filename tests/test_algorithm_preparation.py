@@ -12,7 +12,20 @@ from smart_qgis.algorithm_parameters import (
 from smart_qgis.contracts import TaskContract
 from smart_qgis.coordinator import TaskCoordinator
 from smart_qgis.task_store import TaskError, TaskStore
-from smart_qgis.task_tools import PrepareAlgorithm, TaskRun
+from smart_qgis.task_tools import PrepareAlgorithm, TaskClarify, TaskRun
+
+
+def test_output_conflict_guidance_requires_an_absolute_path():
+    guidance = TaskClarify.model_validate({
+        "task_id": "task", "question": "Replace the old map?", "user_response": "Overwrite it.",
+        "output_conflict": {"path": "/tmp/map.png", "action": "overwrite"},
+    })
+    assert guidance.output_conflict.action == "overwrite"
+    with pytest.raises(ValidationError, match="absolute"):
+        TaskClarify.model_validate({
+            "task_id": "task", "question": "Replace the old map?", "user_response": "Overwrite it.",
+            "output_conflict": {"path": "map.png", "action": "overwrite"},
+        })
 
 
 def test_matrix_rows_are_flattened_without_changing_values():
@@ -39,6 +52,15 @@ def test_live_help_normalizes_representation_without_inventing_values():
     assert normalize_supplied_value(integer, "3") == 3
     assert normalize_supplied_value(boolean, "false") is False
     assert normalize_supplied_value(crs, "4326") == "4326"
+
+
+def test_live_help_normalizes_unambiguous_raster_band_labels():
+    bands = AlgorithmParameter(
+        name="BANDS", description="Bands", type="band", multiple=True,
+    )
+
+    assert normalize_supplied_value(bands, ["Band_1", "band 2", "3"]) == [1, 2, 3]
+    assert normalize_supplied_value(bands, ["elevation"]) == ["elevation"]
 
 
 def test_gdal_formula_preflight_accepts_elementwise_supported_syntax():
@@ -221,7 +243,7 @@ async def test_prepare_algorithm_persists_and_resumes_typed_questions(
         "answer": answer,
     })
     assert answered["prepared_algorithm"] == "test:parameter"
-    assert answered["next_call"]["tool"] == "task_execute_next"
+    assert answered["next_call"]["tool"] == "task_execute"
     row = coordinator.store.db.execute(
         "SELECT body FROM steps WHERE id='generic_step'"
     ).fetchone()
@@ -273,7 +295,7 @@ async def test_task_answer_replays_saved_answer_after_preflight_interruption(tmp
         "answer": 1,
     })
     assert resumed["prepared_algorithm"] == "test:parameter"
-    assert resumed["next_call"]["tool"] == "task_execute_next"
+    assert resumed["next_call"]["tool"] == "task_execute"
     assert coordinator.store.db.execute(
         "SELECT status FROM steps WHERE id='calculator'"
     ).fetchone()[0] == "PLANNED"
@@ -338,6 +360,32 @@ async def test_prepare_algorithm_compiles_multilayer_bindings_to_asset_list(tmp_
     contract = json.loads(row["body"])
     assert contract["inputs"] == ["source"]
     assert contract["arguments"]["parameters"]["STACK"] == ["asset:source"]
+    await coordinator.close()
+
+
+async def test_prepare_algorithm_unwraps_single_layer_binding_list(tmp_path):
+    parameter = {
+        "name": "METHOD", "description": "Method", "type": "enum",
+        "destination": False, "required": True, "has_default": True,
+        "default": 0, "definition": {},
+    }
+    coordinator = ready_coordinator(tmp_path, parameter)
+    prepared = await coordinator.call("prepare_algorithm", {
+        "task_id": coordinator.store.task_id,
+        "continuation_token": coordinator.issue_continuation(),
+        "step_id": "single_layer_step",
+        "algorithm": "test:parameter",
+        "inputs": {"INPUT": ["source"]},
+        "outputs": {"OUTPUT": "scratch_raster"},
+        "parameters": {},
+    })
+    row = coordinator.store.db.execute(
+        "SELECT body FROM steps WHERE id='single_layer_step'"
+    ).fetchone()
+    contract = json.loads(row["body"])
+    assert contract["arguments"]["parameters"]["INPUT"] == "asset:source"
+    plan = coordinator.store.algorithm_plan(prepared["plan_id"])
+    assert any(item["reason"] == "single_layer_binding" for item in plan["normalizations"])
     await coordinator.close()
 
 
@@ -428,7 +476,7 @@ async def test_prepare_algorithm_carries_repair_reference_and_required_checks(tm
 
     async def capture_step(request):
         submitted.append(request)
-        return {"next_call": {"tool": "task_execute_next", "arguments": {"continuation_token": "example"}}}
+        return {"next_call": {"tool": "task_execute", "arguments": {"continuation_token": "example"}}}
 
     monkeypatch.setattr(coordinator, "submit_step_contract", capture_step)
     prepared = await coordinator.call("prepare_algorithm", {
@@ -506,7 +554,7 @@ async def test_user_clarification_reopens_compact_preparation_after_three_reject
     with pytest.raises(TaskError) as error:
         await coordinator.call("prepare_algorithm", request)
     assert error.value.payload["code"] == "CLARIFICATION_REQUIRED"
-    clarified = await coordinator.call("task_record_guidance", {
+    clarified = await coordinator.call("task_update", {
         "task_id": task_id,
         "continuation_token": coordinator.issue_continuation(),
         "question": "How should the operation continue?",
@@ -532,7 +580,7 @@ async def test_custom_correction_limit_applies_until_user_clarifies(tmp_path):
     with pytest.raises(TaskError) as error:
         coordinator.correction_gate("prepare_algorithm", {"task_id": store.task_id})
     assert error.value.payload["evidence"]["limit"] == 5
-    clarified = await coordinator.call("task_record_guidance", {
+    clarified = await coordinator.call("task_update", {
         "task_id": store.task_id,
         "continuation_token": coordinator.issue_continuation(),
         "question": "How should I proceed?",

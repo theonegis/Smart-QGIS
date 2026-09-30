@@ -5,9 +5,11 @@ import os
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
+from smart_qgis.coordinator import TaskCoordinator, explicitly_authorizes_output_overwrite
 from smart_qgis.task_store import TaskError, TaskStore, fingerprint, sync_tree
 
 
@@ -91,6 +93,95 @@ def test_retention_zero_disables_cleanup_and_invalid_values_fail(tmp_path):
     with pytest.raises(TaskError) as failure:
         TaskStore.cleanup_expired(tmp_path, failed_retention_days=-1, now=now)
     assert failure.value.payload["code"] == "INVALID_CONFIG"
+
+
+def test_declared_output_destination_is_preserved_and_existing_file_is_not_overwritten(tmp_path):
+    destination = tmp_path / "desktop" / "result.tif"
+    store = TaskStore.create(
+        tmp_path / "state", "Output", {},
+        [{"id": "result", "description": "Raster", "kind": "raster", "path": str(destination)}], {},
+    )
+    coordinator = TaskCoordinator.__new__(TaskCoordinator)
+    coordinator.store = store
+    output = SimpleNamespace(id="result", kind="raster", filename=None)
+    try:
+        assert coordinator.output_path(output, tmp_path / "temporary") == str(destination)
+        assert destination.parent.is_dir()
+        destination.write_bytes(b"existing")
+        with pytest.raises(TaskError) as failure:
+            coordinator.output_path(output, tmp_path / "temporary")
+        assert failure.value.payload["code"] == "OUTPUT_EXISTS"
+        assert failure.value.payload["evidence"]["question"]["kind"] == "output_conflict"
+        assert failure.value.payload["evidence"]["decision_calls"]["overwrite"] == {
+            "tool": "task_update",
+            "arguments": {
+                "task_id": store.task_id,
+                "instruction": "The user explicitly authorized replacement of this exact file",
+                "output_conflict": {"path": str(destination), "action": "overwrite"},
+            },
+        }
+        assert "task_record_guidance" not in str(failure.value.payload)
+        assert coordinator.output_conflict_resolution(destination) is None
+        store.event("OUTPUT_CONFLICT_RESOLUTION", {"path": str(destination), "action": "overwrite"})
+        assert coordinator.output_path(output, tmp_path / "temporary") == str(destination)
+        assert not destination.exists()
+    finally:
+        store.close()
+
+
+def test_task_start_overwrite_authorizes_only_declared_final_paths(tmp_path):
+    exact = tmp_path / "desktop" / "result.tif"
+    directory = tmp_path / "exports"
+    store = TaskStore.create(
+        tmp_path / "state", "Output", {},
+        [
+            {"id": "result", "description": "Raster", "kind": "raster", "path": str(exact)},
+            {"id": "map", "description": "Map", "kind": "image", "directory": str(directory)},
+            {"id": "temporary", "description": "Temporary", "kind": "pdf"},
+        ], {},
+    )
+    coordinator = TaskCoordinator.__new__(TaskCoordinator)
+    coordinator.store = store
+    try:
+        coordinator.authorize_declared_output_overwrites(
+            store.task()["deliverables"], source="test"
+        )
+        assert coordinator.output_conflict_resolution(exact) == "overwrite"
+        assert coordinator.output_conflict_resolution(directory / "map.png") == "overwrite"
+        assert coordinator.output_conflict_resolution(tmp_path / "other.pdf") is None
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("instruction", "authorized"),
+    [
+        ("若有同名文件请直接覆盖", True),
+        ("目标输出文件已存在时自动覆盖", True),
+        ("目标文件有重复直接覆盖", True),
+        ("overwrite existing output files", True),
+        ("不要覆盖同名文件", False),
+        ("ask me before overwrite", False),
+        ("请生成新的输出文件", False),
+    ],
+)
+def test_only_unambiguous_output_overwrite_instructions_are_authorized(instruction, authorized):
+    assert explicitly_authorizes_output_overwrite(instruction) is authorized
+
+
+def test_undeclared_output_destination_uses_the_ephemeral_execution_directory(tmp_path):
+    store = TaskStore.create(
+        tmp_path / "state", "Output", {},
+        [{"id": "result", "description": "Raster", "kind": "raster"}], {},
+    )
+    coordinator = TaskCoordinator.__new__(TaskCoordinator)
+    coordinator.store = store
+    temporary = tmp_path / "system-temporary" / "execution"
+    try:
+        output = SimpleNamespace(id="result", kind="raster", filename=None)
+        assert coordinator.output_path(output, temporary) == str(temporary / "result.tif")
+    finally:
+        store.close()
 
 
 def test_exclusive_task_ownership_across_processes(store):

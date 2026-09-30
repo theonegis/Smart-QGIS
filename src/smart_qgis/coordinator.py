@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import random
+import re
 import sqlite3
 import time
 import uuid
@@ -41,7 +42,15 @@ from .contracts import (
     verifier_catalog,
 )
 from .observability import TraceExporter
-from .task_store import TaskError, TaskStore, canonical, fingerprint, state_root, sync_tree
+from .task_store import (
+    TaskError,
+    TaskStore,
+    canonical,
+    fingerprint,
+    state_root,
+    sync_tree,
+    temporary_output_root,
+)
 
 CONTEXT = {"task_id", "step_id", "continuation_token"}
 READ_ACTIONS = {
@@ -60,6 +69,30 @@ EXTENSIONS = {
     "style": ".qml",
     "template": ".qpt",
 }
+
+# A user may state output replacement as part of the natural-language goal,
+# while a compact MCP client can omit the matching boolean/structured field.
+# Recognize only unequivocal authorization. The resulting permission remains
+# limited to exact declared final deliverables; temporary paths, directories
+# and symlinks are never covered.
+OVERWRITE_DENIAL = re.compile(
+    r"(?:不(?:要|得|可)|禁止|先询问|需要询问).{0,12}覆盖|"
+    r"\b(?:do\s+not|never|ask\s+(?:me\s+)?before)\s+overwrite\b",
+    re.IGNORECASE,
+)
+OVERWRITE_AUTHORIZATION = re.compile(
+    r"(?:同名|重名|已有|已存在|重复|目标|输出).{0,16}(?:文件|路径)?.{0,8}"
+    r"(?:请|可|就|则)?(?:直接|自动|允许|可以)?覆盖|"
+    r"(?:直接|自动|允许|可以).{0,8}覆盖(?:同名|重名|已有|已存在|重复|目标|输出)?|"
+    r"\b(?:overwrite|replace)\s+(?:any\s+)?(?:existing|same[- ]named|duplicate)\s+"
+    r"(?:output\s+)?files?\b",
+    re.IGNORECASE,
+)
+
+
+def explicitly_authorizes_output_overwrite(text):
+    """Return true only for a direct, unnegated output-replacement instruction."""
+    return bool(text and not OVERWRITE_DENIAL.search(text) and OVERWRITE_AUTHORIZATION.search(text))
 
 
 def is_read(operation, arguments):
@@ -146,7 +179,7 @@ class TaskCoordinator:
 
     def compact_next_call(self, next_call):
         return {
-            "tool": "task_execute_next",
+            "tool": "task_execute",
             "arguments": {"continuation_token": self.issue_route(next_call)},
         }
 
@@ -175,7 +208,7 @@ class TaskCoordinator:
             route = json.loads(row["body"])
             target = route.get("next_tool")
             arguments = dict(route.get("arguments", {}))
-            if target == "task_execute":
+            if target == "step_execute":
                 step_id = arguments.get("step_id")
                 step = store.db.execute(
                     "SELECT status FROM steps WHERE id=?", (step_id,)
@@ -205,7 +238,7 @@ class TaskCoordinator:
         if len(planned) == 1:
             step_id = planned[0]["id"]
             return self.issue_route({
-                "tool": "task_execute",
+                "tool": "step_execute",
                 "arguments": {
                     "task_id": store.task_id,
                     "step_id": step_id,
@@ -221,7 +254,35 @@ class TaskCoordinator:
     def compact_arguments(self, operation, arguments):
         """Inject machine-owned state handles hidden from the compact MCP schema."""
         arguments = dict(arguments)
-        if operation == "task_execute_next" and not arguments.get("continuation_token"):
+        if operation == "project" and "action" not in arguments:
+            arguments["action"] = "info"
+        if operation == "task_update" and "instruction" in arguments:
+            # The public task_update tool has no internal clarification terms.
+            arguments["question"] = "User-requested task update"
+            arguments["user_response"] = arguments.pop("instruction")
+        if operation == "prepare_algorithm" and "step_id" not in arguments:
+            store = self.require_task(arguments.get("task_id"))
+            base = "processing_" + "".join(
+                char if char.isalnum() else "_" for char in arguments["algorithm"]
+            )[:96]
+            existing = {row[0] for row in store.db.execute("SELECT id FROM steps")}
+            step_id, number = base, 2
+            while step_id in existing:
+                suffix = f"_{number}"
+                step_id = base[:128 - len(suffix)] + suffix
+                number += 1
+            arguments["step_id"] = step_id
+            # A failed operation is repaired only when its declared logical
+            # outputs match the new request; clients never name that step.
+            failed = [row["id"] for row in store.db.execute(
+                "SELECT id,status,body FROM steps ORDER BY rowid DESC"
+            ) if row["status"] in {"FAILED", "INVALIDATED"}
+                      and set(arguments.get("outputs", {}).values()).intersection(
+                          output.id for output in StepContract.model_validate_json(row["body"]).outputs
+                      )]
+            if failed:
+                arguments["repairs_step"] = failed[0]
+        if operation == "task_execute" and not arguments.get("continuation_token"):
             arguments["continuation_token"] = self.compact_route_handle()
             return arguments
         if operation == "task_recover" and arguments.get("retry_step") and not arguments.get(
@@ -242,7 +303,7 @@ class TaskCoordinator:
             return arguments
         if operation in {
             "prepare_algorithm", "task_answer", "task_invalidate",
-            "task_record_guidance",
+            "task_update", "task_restart", "task_stop",
         } and not arguments.get("continuation_token"):
             task_id = arguments.get("task_id")
             if task_id is not None:
@@ -254,6 +315,16 @@ class TaskCoordinator:
         """Remove machine handles from model-visible compact MCP responses."""
         if isinstance(value, list):
             return [self.compact_response(item) for item in value]
+        if isinstance(value, str):
+            # Durable internals may occur inside nested failure evidence.  A
+            # compact client must only ever be directed to its public tools.
+            for private, public in (
+                ("task_recover", "task_resume"),
+                ("task_begin", "task_start"),
+                ("inspect_data", "data_info"),
+            ):
+                value = value.replace(private, public)
+            return value
         if not isinstance(value, dict):
             return value
         result = {
@@ -262,8 +333,10 @@ class TaskCoordinator:
             if key != "continuation_token"
         }
         next_call = result.get("next_call")
-        if isinstance(next_call, dict) and next_call.get("tool") == "task_execute_next":
-            result["next_call"] = {"tool": "task_execute_next", "arguments": {}}
+        if isinstance(next_call, dict) and next_call.get("tool") in {
+            "step_execute", "task_execute",
+        }:
+            result["next_call"] = {"tool": "task_execute", "arguments": {}}
         return result
 
     def presentation_options(self):
@@ -273,21 +346,69 @@ class TaskCoordinator:
         ).fetchone()
         return json.loads(row["body"]) if row else {}
 
+    @staticmethod
+    def deliverable_destination(item):
+        """Return the exact final path governed by an output decision, if any."""
+        if item.get("path"):
+            return str(Path(item["path"]).expanduser().resolve())
+        if item.get("directory") and item.get("kind") in EXTENSIONS:
+            return str(
+                (Path(item["directory"]).expanduser() /
+                 (item["id"] + EXTENSIONS[item["kind"]])).resolve()
+            )
+        return None
+
+    def pending_output_conflict(self):
+        """Return the newest failed output conflict that lacks a later decision."""
+        store = self.require_task()
+        for row in store.db.execute(
+            "SELECT a.step_id,a.failure FROM attempts a JOIN steps s ON s.id=a.step_id "
+            "WHERE a.status='FAILED' AND s.status='FAILED' ORDER BY a.created DESC"
+        ):
+            failure = json.loads(row["failure"] or "{}")
+            if failure.get("code") != "OUTPUT_EXISTS":
+                continue
+            path = (failure.get("evidence") or {}).get("path")
+            if path and self.output_conflict_resolution(path) is None:
+                return {"step_id": row["step_id"], "path": str(Path(path).resolve())}
+        return None
+
+    def authorize_declared_output_overwrites(self, deliverables, *, source):
+        """Persist one explicit task-start authorization per exact final path."""
+        with self.require_task().transaction():
+            for item in deliverables:
+                destination = self.deliverable_destination(item)
+                if destination is not None:
+                    self.store.event("OUTPUT_CONFLICT_RESOLUTION", {
+                        "path": destination,
+                        "action": "overwrite",
+                        "source": source,
+                    })
+
     def presentation_pending(self):
         task = self.require_task().task()
         maps = [item for item in task["deliverables"]
                 if item["kind"] in {"image", "pdf", "project", "layout"}]
-        data = [item for item in task["deliverables"]
-                if item["kind"] in {"vector", "raster"}]
         assets = self.assets()
-        processing_committed = any(
-            row["status"] == "COMMITTED"
-            and json.loads(row["body"])["operation"] == "run_processing"
-            for row in self.store.db.execute("SELECT status,body FROM steps")
-        )
-        return bool(processing_committed and maps and data
-                    and all(item["id"] in assets for item in data)
+        data_ids = self.presentation_data_ids(assets)
+        return bool(maps and data_ids
+                    and all(item in assets and assets[item].get("layer_id") for item in data_ids)
                     and any(item["id"] not in assets for item in maps))
+
+    def presentation_data_ids(self, assets=None):
+        """Return retained map layers for either analysis-plus-map or map-only tasks."""
+        assets = self.assets() if assets is None else assets
+        declared = [item["id"] for item in self.require_task().task()["deliverables"]
+                    if item["kind"] in {"vector", "raster"}]
+        if declared:
+            return declared
+        # A map-only workflow has no vector/raster deliverable.  Its invalidated
+        # layout still records exactly which loaded layer assets are safe to reuse.
+        for row in reversed(list(self.store.db.execute("SELECT body FROM steps ORDER BY rowid"))):
+            step = StepContract.model_validate_json(row["body"])
+            if step.operation == "layout":
+                return [key for key in step.inputs if key in assets and assets[key].get("layer_id")]
+        return []
 
     def read_continuation(self, token, *, purpose="continue", step_id=None):
         store = self.require_task()
@@ -320,14 +441,14 @@ class TaskCoordinator:
     def route_record(self, token):
         if not isinstance(token, str) or len(token) != 32:
             raise TaskError(
-                "INVALID_CONTINUATION", "The task_execute_next handle is invalid",
+                "INVALID_CONTINUATION", "The task_execute handle is invalid",
                 next_action="Copy the latest 32-character token unchanged",
             )
         try:
             int(token, 16)
         except ValueError as exc:
             raise TaskError(
-                "INVALID_CONTINUATION", "The task_execute_next handle is invalid",
+                "INVALID_CONTINUATION", "The task_execute handle is invalid",
                 next_action="Copy the latest 32-character token unchanged",
             ) from exc
         store = self.require_task()
@@ -338,7 +459,7 @@ class TaskCoordinator:
             if payload.get("route_id") == token:
                 return payload
         raise TaskError(
-            "INVALID_CONTINUATION", "The task_execute_next handle is unknown",
+            "INVALID_CONTINUATION", "The task_execute handle is unknown",
             next_action="Copy the latest 32-character token unchanged",
         )
 
@@ -353,11 +474,11 @@ class TaskCoordinator:
             raise TaskError(
                 "STALE_CONTINUATION",
                 "The action token is older than the current task state",
-                next_action="Use the latest task_execute_next token returned by the service",
+                next_action="Use the latest task_execute token returned by the service",
             )
         target = payload.get("next_tool")
         allowed = {
-            "task_contract_submit", "workflow_run", "task_execute", "task_finish", "plan_execute",
+            "task_contract_submit", "workflow_run", "step_execute", "task_finish", "plan_execute",
             "presentation_continue",
         }
         if target not in allowed:
@@ -367,7 +488,7 @@ class TaskCoordinator:
             )
         arguments = dict(payload.get("arguments") or {})
         step_id = arguments.get("step_id")
-        purpose = "execute" if target == "task_execute" else "continue"
+        purpose = "execute" if target == "step_execute" else "continue"
         arguments.update({
             "task_id": store.task_id,
             "continuation_token": self.issue_continuation(
@@ -597,7 +718,7 @@ class TaskCoordinator:
         code = error.payload['code']
         diagnostic = {
             "task_diagnose", "contract_get", "contract_help", "inspect_data", "layer_info",
-            "task_recover", "task_record_guidance", "task_answer",
+            "task_recover", "task_update", "task_answer",
         }
         invalid_execution = {
             "INVALID_ARGUMENTS", "INVALID_PARAMETERS", "CONTRACT_REQUIRED", "STEP_CONTRACT_REQUIRED",
@@ -606,10 +727,10 @@ class TaskCoordinator:
         discovery_rejection = operation == "algorithm_info" and code in {
             "INVALID_ARGUMENTS", "INVALID_PARAMETERS", "OPERATION_FAILED", "UNKNOWN_ALGORITHM",
         }
-        if code in {"CLARIFICATION_REQUIRED", "USER_INTERVENTION_REQUIRED", "WORKER_TIMEOUT", "TASK_AMBIGUOUS"} or operation in diagnostic or (is_read(operation, arguments) and not discovery_rejection):
+        if code in {"CLARIFICATION_REQUIRED", "USER_INTERVENTION_REQUIRED", "WORKER_TIMEOUT", "TASK_AMBIGUOUS", "OUTPUT_EXISTS"} or operation in diagnostic or (is_read(operation, arguments) and not discovery_rejection):
             return
         if operation not in {
-            "task_begin", "task_start", "task_execute_next", "task_contract_submit",
+            "task_begin", "task_start", "task_execute", "step_execute", "task_contract_submit",
             "step_prepare", "workflow_run", "step_contract_submit", "prepare_algorithm",
             "algorithm_info",
         } and code not in invalid_execution:
@@ -621,7 +742,7 @@ class TaskCoordinator:
         count = self.correction_failures()
         error.payload["correction_budget"] = {"rejected_submissions": count, "limit": self.correction_limit, "remaining": max(0, self.correction_limit-count)}
         if count >= self.correction_limit:
-            error.payload["next_action"] = "Stop automatic correction. Explain the unresolved problem and ask the user how to proceed. Record their actual answer with task_record_guidance before continuing."
+            error.payload["next_action"] = "Stop automatic correction. Explain the unresolved problem and ask the user how to proceed. Record their actual answer with task_update before continuing."
 
     def correction_gate(self, operation, arguments):
         arguments = arguments if isinstance(arguments, dict) else {}
@@ -651,7 +772,7 @@ class TaskCoordinator:
             )
         diagnostic_allowed = {
             "task_diagnose", "contract_get", "contract_help", "inspect_data", "layer_info",
-            "task_record_guidance", "task_answer",
+            "task_update", "task_answer",
         }
         if self.timeout_needs_user() and operation not in diagnostic_allowed:
             raise TaskError(
@@ -659,7 +780,7 @@ class TaskCoordinator:
                 "A QGIS tool call timed out; wait for user guidance before continuing",
                 phase="recovery",
                 next_action="Show the timeout and current task status to the user. "
-                            "After their actual instruction, record it with task_record_guidance or task_answer.",
+                            "After their actual instruction, record it with task_update or task_answer.",
             )
         # A cached response is not another execution or correction attempt.
         # The server derives its private idempotency key from the opaque token.
@@ -667,7 +788,7 @@ class TaskCoordinator:
             self.store
             and arguments.get("task_id") == self.store.task_id
             and isinstance(arguments.get("continuation_token"), str)
-            and operation == "task_execute"
+            and operation == "step_execute"
         ):
             try:
                 authorization = self.authorize_continuation(
@@ -687,7 +808,7 @@ class TaskCoordinator:
             raise TaskError(
                 "CLARIFICATION_REQUIRED", "Preparation or execution-argument correction limit reached; automatic correction is stopped",
                 phase="preflight", evidence={"rejected_submissions": self.correction_failures(), "limit": self.correction_limit},
-                next_action="Stop retrying. Explain the unresolved input or parameter choice and the latest error to the user. After their actual answer, call task_record_guidance. Do not create another task to evade this limit.",
+                next_action="Stop retrying. Explain the unresolved input or parameter choice and the latest error to the user. After their actual answer, call task_update. Do not create another task to evade this limit.",
             )
 
     async def clarify(self, a):
@@ -698,25 +819,260 @@ class TaskCoordinator:
                     "note": "No task exists yet; start a task after the user's clarification"}
         store = self.require_task(a["task_id"])
         store.require_version(a["expected_state_version"])
+        pending_conflict = self.pending_output_conflict()
+        resolution = a.get("output_conflict")
+        resolution_source = "structured_task_update"
+        if (
+            pending_conflict
+            and resolution is None
+            and explicitly_authorizes_output_overwrite(a.get("user_response", ""))
+        ):
+            # Bind the user's explicit plain-language answer to the exact path
+            # reported by the server; the client never chooses another path.
+            resolution = {"path": pending_conflict["path"], "action": "overwrite"}
+            a = {**a, "output_conflict": resolution}
+            resolution_source = "explicit_task_update_instruction"
+        if pending_conflict and resolution is None:
+            path = pending_conflict["path"]
+            raise TaskError(
+                "OUTPUT_CONFLICT_DECISION_REQUIRED",
+                "The pending output conflict requires the structured output_conflict field; instruction text alone is not authorization",
+                phase="authorization",
+                evidence={
+                    "path": path,
+                    "decision_calls": {
+                        "retry": {
+                            "tool": "task_update",
+                            "arguments": {
+                                "task_id": store.task_id,
+                                "instruction": "The user confirmed that this exact file was removed",
+                                "output_conflict": {"path": path, "action": "retry"},
+                            },
+                        },
+                        "overwrite": {
+                            "tool": "task_update",
+                            "arguments": {
+                                "task_id": store.task_id,
+                                "instruction": "The user explicitly authorized replacement of this exact file",
+                                "output_conflict": {"path": path, "action": "overwrite"},
+                            },
+                        },
+                    },
+                },
+                next_action=(
+                    "Ask whether this exact file may be replaced. After explicit approval, call "
+                    "task_update with output_conflict.path copied exactly and action=overwrite."
+                ),
+            )
+        if resolution is not None:
+            if pending_conflict is None:
+                raise TaskError(
+                    "OUTPUT_CONFLICT_NOT_PENDING",
+                    "No unresolved OUTPUT_EXISTS failure is waiting for an overwrite decision",
+                    phase="authorization",
+                    next_action="Use task_diagnose to inspect the current failure before submitting an output decision",
+                )
+            if resolution["path"] != pending_conflict["path"]:
+                raise TaskError(
+                    "OUTPUT_CONFLICT_PATH_MISMATCH",
+                    "The overwrite decision must use the exact path reported by OUTPUT_EXISTS",
+                    phase="authorization",
+                    evidence={"expected_path": pending_conflict["path"]},
+                    next_action="Copy expected_path unchanged into task_update.output_conflict.path",
+                )
+            if resolution["action"] == "retry" and Path(resolution["path"]).exists():
+                raise TaskError(
+                    "OUTPUT_STILL_EXISTS",
+                    "Retry without overwrite is allowed only after the existing file was removed",
+                    phase="authorization",
+                    evidence={"path": resolution["path"]},
+                    next_action="Remove the exact file or explicitly authorize overwrite, then call task_update",
+                )
         map_coordinate_crs = self.coordinate_crs(a.get("map_coordinate_crs"))
-        await self.validate_coordinate_crs(map_coordinate_crs)
+        annotation_crs = await self.validate_coordinate_crs(map_coordinate_crs)
+        annotation_format = (a.get("map_coordinate_annotations") or {}).get("format", "auto")
+        if (
+            annotation_format in {"degree_minute", "degree_minute_second"}
+            and annotation_crs is not None
+            and not annotation_crs.get("geographic", False)
+        ):
+            raise TaskError(
+                "INVALID_COORDINATE_FORMAT",
+                "Degree-based coordinate labels require a geographic annotation CRS",
+            )
+        if (
+            (a.get("map_coordinate_annotations") or {}).get("cardinal_directions") is True
+            and annotation_crs is not None
+            and not annotation_crs.get("geographic", False)
+        ):
+            raise TaskError(
+                "INVALID_COORDINATE_FORMAT",
+                "E/W/N/S coordinate suffixes require a geographic annotation CRS",
+            )
+        map_crs = self.coordinate_crs(a.get("map_crs"))
+        await self.validate_coordinate_crs(map_crs, label="map display CRS")
+        operational_changed = any(a.get(name) is not None for name in (
+            "services", "layer_operations", "data_operations", "project_update",
+        ))
+        presentation_changed = any(a.get(name) is not None for name in
+               ("map_layers", "map_title", "legend_title", "map_language", "show_legend_title", "north_arrow",
+                "page_orientation", "map_crs", "map_frame", "map_elements", "map_coordinate_annotations",
+                "map_raster_styles", "map_vector_styles", "map_coordinate_crs", "basemap"))
+        if operational_changed and presentation_changed:
+            raise TaskError(
+                "UPDATE_SPLIT_REQUIRED",
+                "Apply project/data operations and presentation changes in separate task_update calls",
+                next_action="Execute the project operation first, then submit the map revision",
+            )
+        if (a.get("project_update") or {}).get("crs"):
+            await self.validate_coordinate_crs(a["project_update"]["crs"])
         with store.transaction():
             store.event("USER_CLARIFICATION", {"question": a["question"], "user_response": a["user_response"]})
-            if any(a.get(name) is not None for name in
-                   ("map_layers", "map_element_placement", "map_raster_styles", "map_coordinate_crs")):
+            if a.get("output_conflict") is not None:
+                store.event("OUTPUT_CONFLICT_RESOLUTION", {
+                    **a["output_conflict"], "source": resolution_source,
+                })
+            if presentation_changed:
                 store.event("TASK_PRESENTATION", {
                     **self.presentation_options(),
                     **({"layers": a["map_layers"]} if a.get("map_layers") is not None else {}),
-                    **({"map_element_placement": a["map_element_placement"]}
-                       if a.get("map_element_placement") is not None else {}),
+                    **({"title": a["map_title"]} if a.get("map_title") is not None else {}),
+                    **({"legend_title": a["legend_title"]} if a.get("legend_title") is not None else {}),
+                    **({"map_language": a["map_language"]} if a.get("map_language") is not None else {}),
+                    **({"show_legend_title": a["show_legend_title"]}
+                       if a.get("show_legend_title") is not None else {}),
+                    **({"north_arrow": a["north_arrow"]}
+                       if a.get("north_arrow") is not None else {}),
+                    **({"page_orientation": a["page_orientation"]}
+                       if a.get("page_orientation") is not None else {}),
+                    **({"map_crs": map_crs} if map_crs is not None else {}),
+                    **({"map_frame": a["map_frame"]}
+                       if a.get("map_frame") is not None else {}),
+                    **({"map_elements": a["map_elements"]}
+                       if a.get("map_elements") is not None else {}),
+                    **({"coordinate_annotations": a["map_coordinate_annotations"]}
+                       if a.get("map_coordinate_annotations") is not None else {}),
                     **({"coordinate_crs": map_coordinate_crs}
                        if map_coordinate_crs is not None else {}),
                     **({"raster_styles": a["map_raster_styles"]}
                        if a.get("map_raster_styles") is not None else {}),
+                    **({"vector_styles": a["map_vector_styles"]}
+                       if a.get("map_vector_styles") is not None else {}),
+                    **({"basemap": a["basemap"]} if a.get("basemap") is not None else {}),
+                })
+            if operational_changed:
+                store.event("TASK_OPERATIONS", {
+                    "services": a.get("services") or {},
+                    "layer_operations": a.get("layer_operations") or [],
+                    "data_operations": a.get("data_operations") or [],
+                    "project_update": a.get("project_update"),
                 })
             store.event("CORRECTION_RESET", {"source": "user_clarification"})
-            store.db.execute("UPDATE task SET state_version=state_version+1")
+            store.db.execute(
+                "UPDATE task SET status=?,state_version=state_version+1",
+                ("READY" if operational_changed else store.task()["status"],),
+            )
+        if resolution is not None:
+            # Resolving a file conflict is an authorization decision, not a
+            # request to rebuild valid analysis.  Re-plan only the failed
+            # operation and return the normal public task_execute route.
+            return await self.resume({
+                "task_id": store.task_id,
+                "retry_step": pending_conflict["step_id"],
+                "continuation_token": self.issue_continuation(),
+                "expected_state_version": store.task()["state_version"],
+                "reason": "User resolved the exact final-output conflict",
+            })
+        if operational_changed:
+            route = self.compact_next_call({
+                "tool": "workflow_run",
+                "arguments": {
+                    "task_id": store.task_id,
+                    "continuation_token": self.issue_continuation(),
+                    "workflow": "project_operations",
+                    "services": a.get("services") or {},
+                    "layer_operations": a.get("layer_operations") or [],
+                    "data_operations": a.get("data_operations") or [],
+                    "project_update": a.get("project_update"),
+                },
+            })
+            return {
+                **self.task_delta(),
+                "status": "READY",
+                "completion_state": "NOT_COMPLETED",
+                "next_call": route,
+                "next_action": "Call task_execute once; the server will checkpoint each requested operation.",
+            }
+        # A reader-facing revision must never re-run correct GIS analysis.  If
+        # a completed layout exists, invalidate that layout and its dependent
+        # exports as one bounded presentation-only repair.
+        if presentation_changed:
+            layout_step = next((row["id"] for row in reversed(list(store.db.execute(
+                "SELECT id,status,body FROM steps ORDER BY rowid"
+            ))) if row["status"] == "COMMITTED"
+                and StepContract.model_validate_json(row["body"]).operation == "layout"), None)
+            if layout_step:
+                repair_result = await self.repair({
+                    "task_id": store.task_id,
+                    "expected_state_version": store.task()["state_version"],
+                    "steps": [layout_step],
+                    "reason": "User requested a presentation-only map revision",
+                })
+                # Reattach the already-known task before issuing the compact
+                # continuation.  A client then has exactly one required next
+                # call instead of having to infer that a recovery response is
+                # still non-terminal.
+                result = await self.resume({"task_id": store.task_id})
+                result["invalidated_steps"] = repair_result["invalidated_steps"]
+                result["presentation_rebuild"] = True
+                result["status"] = "READY"
+                result["completion_state"] = "NOT_COMPLETED"
+                result["next_call"] = {"tool": "task_execute", "arguments": {}}
+                result["next_action"] = (
+                    "The revised map has NOT been created yet. Call task_execute once with "
+                    "no arguments to rebuild and validate only the layout and exports; report "
+                    "completion only if that call returns COMPLETED."
+                )
+                return result
         return self.compact_status()
+
+    async def stop_task(self, a):
+        """Stop at the last durable checkpoint without deleting evidence."""
+        store = self.require_task(a["task_id"])
+        with store.transaction():
+            store.db.execute("UPDATE task SET status='CANCELLED',state_version=state_version+1")
+            store.event("TASK_STOPPED", {"reason": a["reason"]})
+        return {"task_id": store.task_id, "state": "stopped", "status": "CANCELLED"}
+
+    async def restart_task(self, a):
+        """Restart a server-selected scope without exposing step identifiers."""
+        store = self.require_task(a["task_id"])
+        if a["scope"] == "map":
+            layout = next((row["id"] for row in reversed(list(store.db.execute(
+                "SELECT id,status,body FROM steps ORDER BY rowid"
+            ))) if row["status"] == "COMMITTED"
+                and StepContract.model_validate_json(row["body"]).operation == "layout"), None)
+            if layout is None:
+                raise TaskError("MAP_RESTART_UNAVAILABLE", "No completed map is available to rebuild")
+            await self.repair({
+                "task_id": store.task_id,
+                "expected_state_version": store.task()["state_version"],
+                "steps": [layout], "reason": a["instruction"],
+            })
+            return await self.resume({"task_id": store.task_id})
+        failed = next((row["id"] for row in reversed(list(store.db.execute(
+            "SELECT id,status FROM steps ORDER BY rowid"
+        ))) if row["status"] == "FAILED"), None)
+        if a["scope"] == "failed_operation" and failed:
+            return await self.resume({
+                "task_id": store.task_id, "retry_step": failed,
+                "continuation_token": self.issue_continuation(), "reason": a["instruction"],
+            })
+        raise TaskError(
+            "RESTART_NEEDS_REVISION",
+            "The requested restart would change the processing meaning or has no failed operation",
+            next_action="Use task_update with the user's concrete revised method, parameter, input or map requirement",
+        )
 
     async def call(self, operation, arguments):
         started = time.monotonic()
@@ -752,7 +1108,7 @@ class TaskCoordinator:
                 if committed_progress:
                     self.store.event("CORRECTION_RESET", {"source": "committed_execution"})
                 if self.store and isinstance(result, dict) and operation in {
-                    "task_begin", "task_start", "task_execute_next", "task_contract_submit",
+                    "task_begin", "task_start", "task_execute", "task_contract_submit",
                     "step_prepare", "workflow_run", "step_contract_submit", "prepare_algorithm",
                 }:
                     failures = self.correction_failures()
@@ -774,12 +1130,13 @@ class TaskCoordinator:
                     self.store.event("USER_INTERVENTION_REQUIRED", {"operation": operation})
                     exc.payload["next_action"] = (
                         "Stop automatic retries. Show the timeout and task status to the user; "
-                        "continue only after their actual instruction is recorded with task_record_guidance or task_answer."
+                        "continue only after their actual instruction is recorded with task_update or task_answer."
                     )
                 if not exc.payload.get("phase"):
                     exc.payload["phase"] = {
                         "task_begin": "preparation", "task_start": "preparation",
-                        "task_execute_next": "execution", "prepare_algorithm": "preparation",
+                        "task_execute": "execution", "step_execute": "execution",
+                        "prepare_algorithm": "preparation",
                         "task_answer": "clarification", "inspect_data": "inspection",
                         "task_contract_submit": "contract", "step_prepare": "contract",
                         "workflow_run": "execution",
@@ -845,11 +1202,13 @@ class TaskCoordinator:
         handlers = {
             "task_start": self.run_task,
             "plan_execute": self.execute_plan,
-            "task_execute_next": self.continue_task,
+            "task_execute": self.continue_task,
             "presentation_continue": self.continue_presentation,
             "task_answer": self.answer_algorithm,
             "prepare_algorithm": self.prepare_algorithm,
-            "task_record_guidance": self.clarify,
+            "task_update": self.clarify,
+            "task_restart": self.restart_task,
+            "task_stop": self.stop_task,
             "task_begin": self.begin,
             "inspect_data": self.inspect,
             "task_contract_submit": self.submit_task_contract,
@@ -894,12 +1253,12 @@ class TaskCoordinator:
                         "from repairs_step; explicitly changed checks are still rejected. "
                         "Reading this contract does not authorize execution."
                     )}
-        if operation == "task_execute":
+        if operation == "step_execute":
             store = self.require_task(arguments["task_id"])
             row = store.db.execute("SELECT body FROM steps WHERE id=?", (arguments["step_id"],)).fetchone()
             if row is None:
                 raise TaskError("STEP_CONTRACT_REQUIRED", "Submit a step contract before execution",
-                                next_action="step_contract_submit; then task_execute with the approved step ID")
+                                next_action="step_contract_submit; then step_execute with the approved step ID")
             step = StepContract.model_validate_json(row["body"])
             authorization = self.authorize_continuation(
                 arguments, purpose="execute", step_id=arguments["step_id"]
@@ -916,7 +1275,7 @@ class TaskCoordinator:
         if operation in continuation_mutations or (
             operation == "task_validate" and arguments.get("revalidate_steps")
         ) or (operation == "task_recover" and arguments.get("retry_step")) or (
-            operation in {"task_record_guidance", "task_answer"} and self.store is not None
+            operation in {"task_update", "task_answer"} and self.store is not None
         ):
             authorization = self.authorize_continuation(arguments)
             arguments = {**arguments, **authorization}
@@ -931,7 +1290,10 @@ class TaskCoordinator:
                 operation, self.resolve(clean, self.assets() if self.store else {})
             )
             if operation == "algorithms" and clean.get("action", "list") != "ramps":
-                entries = result.get("algorithms", [result])
+                entries = result.get("algorithms")
+                entries = [result] if entries is None else [
+                    *entries, *result.get("suggestions", [])
+                ]
                 for item in entries:
                     item["reliable_supported"] = True
                 result["execution_mode"] = "reliable"
@@ -979,16 +1341,17 @@ class TaskCoordinator:
     def coordinate_crs(value):
         return "EPSG:4326" if isinstance(value, str) and value.strip().lower() == "geographic" else value
 
-    async def validate_coordinate_crs(self, value):
+    async def validate_coordinate_crs(self, value, *, label="coordinate annotation CRS"):
         if value is None:
-            return
+            return None
         result = await self.bridge.call("_validate_crs", {"value": value})
         if not result["valid"]:
             raise TaskError(
-                "INVALID_CRS", "Coordinate annotation CRS is invalid",
-                evidence={"coordinate_crs": value},
+                "INVALID_CRS", f"{label.capitalize()} is invalid",
+                evidence={label.replace(" ", "_"): value},
                 next_action="Choose a valid installed CRS such as EPSG:4326, or omit this optional field",
             )
+        return result
 
     async def create_task(self, a, *, inspect_inputs=False, coordinate_crs=None):
         if self.store and self.store.unresolved():
@@ -1069,7 +1432,32 @@ class TaskCoordinator:
 
     async def run_task(self, a):
         """Inspect and contract a task, then bind its exact safe execution route."""
-        a = {**a, "coordinate_crs": self.coordinate_crs(a.get("coordinate_crs"))}
+        a = {
+            **a,
+            "coordinate_crs": self.coordinate_crs(a.get("coordinate_crs")),
+            "map_crs": self.coordinate_crs(a.get("map_crs")),
+        }
+        await self.validate_coordinate_crs(a["map_crs"], label="map display CRS")
+        annotation_crs = await self.validate_coordinate_crs(a["coordinate_crs"])
+        annotation_format = (a.get("coordinate_annotations") or {}).get("format", "auto")
+        if (
+            annotation_format in {"degree_minute", "degree_minute_second"}
+            and annotation_crs is not None
+            and not annotation_crs.get("geographic", False)
+        ):
+            raise TaskError(
+                "INVALID_COORDINATE_FORMAT",
+                "Degree-based coordinate labels require a geographic annotation CRS",
+            )
+        if (
+            (a.get("coordinate_annotations") or {}).get("cardinal_directions") is True
+            and annotation_crs is not None
+            and not annotation_crs.get("geographic", False)
+        ):
+            raise TaskError(
+                "INVALID_COORDINATE_FORMAT",
+                "E/W/N/S coordinate suffixes require a geographic annotation CRS",
+            )
         # A rejected compact contract must not leave a durable PREPARING task
         # that the compact tool set cannot amend.
         contract = self.parse_contract(TaskContract, a.get("contract", {}))
@@ -1087,6 +1475,14 @@ class TaskCoordinator:
             inspect_inputs=True,
             coordinate_crs=a["coordinate_crs"],
         )
+        if a.get("overwrite_existing_outputs"):
+            self.authorize_declared_output_overwrites(
+                a["deliverables"], source="explicit_task_start_option"
+            )
+        elif explicitly_authorizes_output_overwrite(a["goal"]):
+            self.authorize_declared_output_overwrites(
+                a["deliverables"], source="explicit_task_start_goal"
+            )
         contracted = await self.submit_task_contract({
             "task_id": started["task_id"],
             "continuation_token": started["continuation_token"],
@@ -1096,14 +1492,60 @@ class TaskCoordinator:
         with self.store.transaction():
             self.store.event("TASK_PRESENTATION", {
                 "title": a.get("title"),
+                "legend_title": a.get("legend_title"),
+                "map_language": a.get("map_language", "auto"),
+                "show_legend_title": a.get("show_legend_title", True),
+                "north_arrow": a.get("north_arrow", False),
+                "page_orientation": a.get("page_orientation", "auto"),
+                "map_crs": a.get("map_crs"),
+                "map_frame": a.get("map_frame", {}),
                 "coordinate_crs": a["coordinate_crs"],
-                "map_element_placement": a.get("map_element_placement", "auto"),
+                "map_elements": a.get("map_elements", {}),
+                "coordinate_annotations": a.get("coordinate_annotations", {}),
+                "basemap": a.get("basemap"),
+                "services": a.get("services", {}),
+                "layer_operations": a.get("layer_operations", []),
+                "data_operations": a.get("data_operations", []),
+                "project_update": a.get("project_update"),
+                "project": a.get("project", {}),
                 "layers": a.get("layers"),
                 "raster_ramp": a["raster_ramp"],
                 "raster_styles": a.get("raster_styles", {}),
+                "vector_styles": a.get("vector_styles", {}),
                 "dpi": a["dpi"],
             })
         next_call = contracted["next_call"]
+        map_requested = any(item["kind"] in {"project", "image", "pdf", "layout"}
+                            for item in self.store.task()["deliverables"])
+        operational_request = bool(
+            a.get("inputs") or a.get("basemap") or a.get("services")
+            or a.get("layer_operations") or a.get("data_operations") or a.get("project_update")
+            or (a.get("project") or {}).get("action", "current") != "current"
+        )
+        explicit_project_operations = bool(
+            a.get("basemap") or a.get("services") or a.get("layer_operations")
+            or a.get("project_update")
+            or (a.get("project") or {}).get("action", "current") != "current"
+        )
+        if operational_request and (
+            not self.store.task()["deliverables"]
+            or bool(a.get("data_operations"))
+            or (
+                explicit_project_operations
+                and all(item["kind"] in {"project", "image", "pdf", "layout"}
+                        for item in self.store.task()["deliverables"])
+            )
+        ):
+            next_call = {
+                "tool": "workflow_run",
+                "arguments": {
+                    "task_id": contracted["task_id"],
+                    "continuation_token": contracted["continuation_token"],
+                    "workflow": (
+                        "standard_map_project" if map_requested else "project_layers"
+                    ),
+                },
+            }
         result = {
             "task_id": contracted["task_id"],
             "status": contracted["status"],
@@ -1122,7 +1564,7 @@ class TaskCoordinator:
                 "route": "controlled_processing_plan",
                 "next_call": self.compact_next_call(next_call),
                 "instructions": (
-                    "The frozen plan is persisted by the continuation handle. Call task_execute_next "
+                    "The frozen plan is persisted by the continuation handle. Call task_execute "
                     "once; the service validates and executes each Processing step in order."
                 ),
             })
@@ -1146,20 +1588,23 @@ class TaskCoordinator:
                 item if item.startswith("asset:") else f"asset:{item}"
                 for item in a["layers"]
             ]
-        for name in ("title", "coordinate_crs", "map_element_placement"):
+        for name in ("title", "legend_title", "map_language", "show_legend_title", "north_arrow", "page_orientation", "map_crs", "map_frame",
+                     "coordinate_crs", "map_elements", "coordinate_annotations", "basemap", "services",
+                     "layer_operations", "data_operations", "project_update", "vector_styles", "project"):
             if a.get(name) is not None:
                 workflow_arguments[name] = a[name]
         workflow_arguments.update({
             "style_layers": a.get("style_layers", True),
             "raster_ramp": a.get("raster_ramp", "Viridis"),
             "raster_styles": a.get("raster_styles", {}),
+            "vector_styles": a.get("vector_styles", {}),
             "dpi": a.get("dpi", 150),
         })
         result.update({
             "route": "standard_map_project",
             "next_call": self.compact_next_call(next_call),
             "instructions": (
-                "Input inspection and the task contract passed. Call task_execute_next once with "
+                "Input inspection and the task contract passed. Call task_execute once with "
                 "the returned token; the service owns all approved workflow arguments."
             ),
         })
@@ -1235,7 +1680,7 @@ class TaskCoordinator:
 
         target, arguments = self.routed_arguments(token)
         result = await self.dispatch_locked(target, arguments)
-        if target == "task_execute":
+        if target == "step_execute":
             presented = await self.auto_present_deliverables(
                 result.get("continuation_token")
             )
@@ -1253,10 +1698,10 @@ class TaskCoordinator:
             finished.pop("continuation_token", None)
             result = finished
         elif next_call and next_call["tool"] in {
-            "task_contract_submit", "workflow_run", "task_execute", "task_finish"
+            "task_contract_submit", "workflow_run", "step_execute", "task_finish"
         }:
             result["next_call"] = self.compact_next_call(next_call)
-        elif target == "task_execute" and next_call and next_call["tool"] == "step_prepare":
+        elif target == "step_execute" and next_call and next_call["tool"] == "step_prepare":
             # ``step_prepare`` is intentionally not part of the compact public
             # surface.  A Processing chain advances by preparing its next live
             # registry algorithm, not by hand-authoring a hidden recipe.
@@ -1300,16 +1745,13 @@ class TaskCoordinator:
             if item["kind"] in {"image", "pdf", "project", "layout"}
         ]
         presentation = self.presentation_options()
-        data = [
-            item for item in task["deliverables"]
-            if item["kind"] in {"vector", "raster"}
-        ]
         assets = self.assets()
-        if not maps or not data or any(item["id"] not in assets for item in data):
+        data_ids = self.presentation_data_ids(assets)
+        if not maps or not data_ids or any(item not in assets for item in data_ids):
             return None
         if all(item["id"] in assets for item in maps):
             return None
-        final_ids = [item["id"] for item in data]
+        final_ids = data_ids
         if any(not assets[key].get("layer_id") for key in final_ids):
             raise TaskError(
                 "PRESENTATION_LAYER_REQUIRED",
@@ -1356,6 +1798,8 @@ class TaskCoordinator:
             return candidate
 
         async def run_step(base_id, contract, token):
+            requested_repair = contract.get("repairs_step")
+            contract = {key: value for key, value in contract.items() if key != "repairs_step"}
             previous = [
                 row for row in step_rows
                 if row["id"] == base_id
@@ -1371,7 +1815,14 @@ class TaskCoordinator:
                     evidence={"step_id": latest["id"], "status": latest["status"]},
                 )
             step_id = unique_id(base_id)
-            repair_step = latest["id"] if latest else None
+            repair_step = latest["id"] if latest else requested_repair
+            if repair_step is None:
+                output_ids = {item["id"] for item in contract.get("outputs", [])}
+                repair_step = next((row["id"] for row in reversed(step_rows)
+                                    if row["status"] == "INVALIDATED"
+                                    and output_ids.intersection(
+                                        output.id for output in StepContract.model_validate_json(row["body"]).outputs
+                                    )), None)
             prepared = await self.submit_step_contract({
                 "task_id": self.store.task_id,
                 "continuation_token": token,
@@ -1392,24 +1843,115 @@ class TaskCoordinator:
                 {"task_id": self.store.task_id, "step_id": step_id, **authorization},
             )
 
+        service_requests = dict(presentation.get("services") or {})
+        if presentation.get("basemap"):
+            service_requests["presentation_basemap"] = presentation["basemap"]
+        for requested_id, requested_service in service_requests.items():
+            provider = requested_service.get("provider", "openstreetmap")
+            existing = requested_id if requested_id in assets else None
+            service_id = existing or unique_id(requested_id)
+            if not existing:
+                worker_service = {
+                    "openstreetmap": "osm", "xyz": "xyz", "wms": "wms",
+                    "wmts": "wmts", "wfs": "wfs",
+                }[provider]
+                token_result = await run_step(
+                    "presentation_service_" + service_id,
+                    {
+                        "operation": "add_basemap",
+                        "arguments": {
+                            "service": worker_service, "url": requested_service.get("url"),
+                            "uri": requested_service.get("uri"),
+                            "name": requested_service.get("name"),
+                            "attribution": requested_service.get("attribution"),
+                            "role": requested_service.get("role"),
+                            "layer_name": requested_service.get("layer_name"),
+                            "type_name": requested_service.get("type_name"),
+                            "style_name": requested_service.get("style_name"),
+                            "crs": requested_service.get("crs"),
+                            "image_format": requested_service.get("image_format", "image/png"),
+                            "version": requested_service.get("version"),
+                            "authcfg": requested_service.get("authcfg"),
+                            "zmin": requested_service.get("zmin", 0),
+                            "zmax": requested_service.get("zmax", 19),
+                        },
+                        "inputs": [],
+                        "outputs": [{
+                            "id": service_id,
+                            "kind": "vector" if provider == "wfs" else "raster",
+                            "binding": "layer",
+                        }],
+                        "reason": "Add the requested contextual map service",
+                    },
+                    continuation,
+                )
+                continuation = token_result["continuation_token"]
+                assets = self.assets()
+            if service_id not in layer_ids:
+                if requested_service.get("role") == "overlay" or provider == "wfs":
+                    layer_ids.insert(0, service_id)
+                else:
+                    layer_ids.append(service_id)
+
         for key in layer_ids:
+            if assets[key].get("remote") and assets[key].get("role") != "overlay":
+                continue
             kind = assets[key]["kind"]
             raster_style = {
                 name: value for name, value in
                 presentation.get("raster_styles", {}).get(key, {}).items()
                 if value is not None
             }
+            style_arguments = (
+                {"layer": f"asset:{key}", "ramp": presentation["raster_ramp"],
+                 "band": 1, "classes": 8, "opacity": 1, **raster_style}
+                if kind == "raster"
+                else {"layer": f"asset:{key}", "color": "#4c78a8", "outline": "#202020",
+                      "width": 0.4, "opacity": 1,
+                      **{name: value for name, value in
+                         presentation.get("vector_styles", {}).get(key, {}).items()
+                         if value is not None}}
+            )
+            style_operation = "style_" + kind
+            style_inputs = [key]
+            if style_arguments.get("mode") == "qml" or style_arguments.get("renderer") == "qml":
+                qml_id = style_arguments.get("qml_asset")
+                if not qml_id or qml_id not in assets or assets[qml_id]["kind"] != "style":
+                    raise TaskError(
+                        "STYLE_ASSET_REQUIRED",
+                        "QML presentation requires a declared style input",
+                        evidence={"layer": key, "qml_asset": qml_id},
+                    )
+                style_operation = "style_file"
+                style_arguments = {
+                    "action": "load", "layer": f"asset:{key}",
+                    "path": f"asset:{qml_id}",
+                }
+                style_inputs.append(qml_id)
+            elif kind == "raster" and style_arguments.get("mode") in {"gray", "rgb", "hillshade"}:
+                style_operation = "render_raster"
+                style_arguments = {
+                    name: value for name, value in style_arguments.items()
+                    if name in {"layer", "mode", "band", "red", "green", "blue", "azimuth",
+                                "altitude", "z_factor", "opacity"}
+                }
+            elif kind == "vector" and style_arguments.get("renderer") == "graduated":
+                style_operation = "style_graduated"
+                style_arguments = {
+                    "layer": style_arguments["layer"],
+                    "field": style_arguments.get("graduated_field"),
+                    "ramp": style_arguments.get("ramp", "Viridis"),
+                    "classes": style_arguments.get("classes", 5),
+                    "method": style_arguments.get("method", "equal_interval"),
+                    "opacity": style_arguments.get("opacity", 1),
+                    "label_field": style_arguments.get("label_field"),
+                }
             token_result = await run_step(
                 "presentation_style_" + key,
                 {
-                    "operation": "style_" + kind,
-                    "arguments": (
-                        {"layer": f"asset:{key}", "ramp": presentation["raster_ramp"],
-                         "band": 1, "classes": 8, "opacity": 1, **raster_style}
-                        if kind == "raster"
-                        else {"layer": f"asset:{key}", "color": "#4c78a8", "outline": "#202020", "width": 0.4, "opacity": 1}
-                    ),
-                    "inputs": [key], "outputs": [],
+                    "operation": style_operation,
+                    "arguments": style_arguments,
+                    "inputs": style_inputs, "outputs": [],
                     "reason": "Apply standard presentation to final Processing output",
                 },
                 continuation,
@@ -1417,6 +1959,9 @@ class TaskCoordinator:
             continuation = token_result["continuation_token"]
 
         layout_outputs = [item for item in maps if item["kind"] == "layout"]
+        prior_layout_step = next((row["id"] for row in reversed(step_rows)
+                                  if StepContract.model_validate_json(row["body"]).operation == "layout"
+                                  and row["status"] in {"COMMITTED", "INVALIDATED"}), None)
         prior_layout = next((
             StepContract.model_validate_json(row["body"]).outputs[0].id
             for row in reversed(step_rows)
@@ -1436,17 +1981,25 @@ class TaskCoordinator:
                 "arguments": {
                     "action": "create", "name": layout_id,
                     "title": presentation["title"] or task["goal"],
+                    "legend_title": presentation.get("legend_title"),
+                    "map_language": presentation.get("map_language", "auto"),
+                    "show_legend_title": presentation.get("show_legend_title", True),
+                    "page_orientation": presentation.get("page_orientation", "auto"),
+                    "crs": presentation.get("map_crs"),
+                    "map_frame": presentation.get("map_frame", {}),
                     "show_title": True, "layers": [f"asset:{key}" for key in layer_ids],
                     "extent_layer": f"asset:{layer_ids[0]}" if len(layer_ids) == 1 else None,
                     "legend": True,
-                    "scalebar": True, "grid": True,
+                    "scalebar": True, "north_arrow": presentation.get("north_arrow", False), "grid": True,
                     "grid_crs": presentation["coordinate_crs"],
-                    "map_element_placement": presentation.get("map_element_placement", "auto"),
+                    "map_elements": presentation.get("map_elements", {}),
+                    "coordinate_annotations": presentation.get("coordinate_annotations", {}),
                     "overwrite": overwrite_layout,
                 },
                 "inputs": layer_ids,
                 "outputs": [{"id": layout_id, "kind": "layout", "binding": "layout"}],
                 "reason": "Create the requested map with basic required elements",
+                "repairs_step": prior_layout_step,
             },
             continuation,
         )
@@ -1558,6 +2111,25 @@ class TaskCoordinator:
                 "INVALID_PARAMETERS", "Input and destination parameter mappings are reversed",
                 evidence={"not_inputs": bad_inputs, "not_destinations": bad_outputs},
             )
+        # Some MCP clients serialize one layer binding as a one-item list.
+        # Processing accepts lists only for multilayer parameters; retaining the
+        # wrapper makes providers such as GRASS fail while resolving the layer.
+        # Normalize this mechanical representation difference, but never choose
+        # an item from an ambiguous multi-item value.
+        for name, value in list(a.get("inputs", {}).items()):
+            if not isinstance(value, list) or by_name[name].type.casefold() == "multilayer":
+                continue
+            if len(value) != 1:
+                raise TaskError(
+                    "INVALID_PARAMETERS",
+                    "A single-layer Processing input must bind exactly one asset",
+                    evidence={"parameter": name, "assets": value},
+                )
+            a["inputs"][name] = value[0]
+            name_normalizations.append({
+                "parameter": name, "from": "single_item_list", "to": "single_asset",
+                "reason": "single_layer_binding",
+            })
         missing_destinations = [
             item.name for item in specifications
             if item.destination and item.required and not item.has_default
@@ -1747,7 +2319,7 @@ class TaskCoordinator:
                 "step_id": plan["step_id"],
                 "step_status": "PLANNED",
                 "next_call": self.compact_next_call({
-                    "tool": "task_execute",
+                    "tool": "step_execute",
                     "arguments": {
                         "task_id": store.task_id,
                         "step_id": plan["step_id"],
@@ -1854,6 +2426,24 @@ class TaskCoordinator:
 
     async def inspect(self, a):
         source = self.resolve(a["source"], self.assets() if self.store else {}, prefer_path=True)
+        if a.get("query"):
+            query = a["query"]
+            layer_source = self.resolve(
+                a["source"], self.assets() if self.store else {}, prefer_path=False
+            )
+            result = await self.bridge.call("features", {
+                "layer": layer_source,
+                "action": query.get("action", "sample"),
+                "expression": query.get("expression"),
+                "limit": query.get("limit", 10),
+                "field": query.get("field"),
+            })
+            if self.store:
+                self.store.event("DATA_QUERIED", {
+                    "source": a["source"], "query": query,
+                    "result_count": len(result.get("features", [])),
+                })
+            return result
         result = await self.bridge.call("_inspect", {"source": source, "kind": a.get("kind")})
         if a.get("include_fingerprint"):
             result["fingerprint"] = await asyncio.to_thread(fingerprint, source)
@@ -1939,9 +2529,23 @@ class TaskCoordinator:
                 "Submit the task contract before running a workflow",
                 next_action="task_contract_submit",
             )
-        unsupported = [
+        layout_deliverable = any(
+            item["kind"] in {"image", "pdf", "layout"} for item in task["deliverables"]
+        )
+        project_deliverable = any(item["kind"] == "project" for item in task["deliverables"])
+        has_map_content = bool(
+            task["inputs"] or a.get("basemap") or a.get("services") or a.get("data_operations")
+        )
+        map_requested = (
+            a.get("workflow") != "project_operations"
+            and (layout_deliverable or (project_deliverable and has_map_content))
+        )
+        data_output_ids = [item["output"] for item in a.get("data_operations", [])]
+        data_output_set = set(data_output_ids)
+        unsupported = [] if a.get("workflow") == "project_operations" else [
             item for item in task["deliverables"]
             if item["kind"] not in {"project", "image", "pdf", "layout"}
+            and item["id"] not in data_output_set
         ]
         if unsupported:
             raise TaskError(
@@ -1957,38 +2561,29 @@ class TaskCoordinator:
             )
 
         task_inputs = task["inputs"]
-        if a.get("layers"):
-            bad_format = [
-                ref for ref in a["layers"]
-                if not isinstance(ref, str) or not ref.startswith("asset:")
-            ]
-            if bad_format:
-                raise TaskError(
-                    "INVALID_RECIPE",
-                    "Workflow layers use asset:<logical_id> references",
-                    evidence={"field": "layers", "expected_format": "asset:<logical_id>"},
-                )
-            source_ids = [ref[6:] for ref in a["layers"]]
-        else:
-            source_ids = [
-                key
-                for key, item in sorted(
-                    task_inputs.items(), key=lambda pair: pair[1]["kind"] != "vector"
-                )
-                if item["kind"] in {"vector", "raster"}
-            ]
-        if not source_ids:
+        source_ids = [] if a.get("workflow") == "project_operations" else [
+            key
+            for key, item in sorted(
+                task_inputs.items(), key=lambda pair: pair[1]["kind"] != "vector"
+            )
+            if item["kind"] in {"vector", "raster"}
+        ]
+        requested_layers = [ref.removeprefix("asset:") for ref in (a.get("layers") or [])]
+        service_requests = dict(a.get("services") or {})
+        if a.get("basemap"):
+            service_requests["__default_basemap__"] = a["basemap"]
+        available_requested = set(task_inputs) | set(service_requests) | data_output_set
+        unknown = sorted(set(requested_layers) - available_requested)
+        if unknown:
+            raise TaskError(
+                "UNKNOWN_ASSET", "Workflow map layers reference unknown logical IDs",
+                evidence={"assets": unknown, "available": sorted(available_requested)},
+            )
+        if not (source_ids or service_requests or data_output_ids) and map_requested:
             raise TaskError(
                 "LAYERS_REQUIRED",
                 "The standard map workflow needs at least one vector or raster task input",
                 next_action="Declare map inputs in task_begin or use individual recipes",
-            )
-        unknown = sorted(set(source_ids) - set(task_inputs))
-        if unknown:
-            raise TaskError(
-                "UNKNOWN_ASSET",
-                "Workflow layers must reference original task inputs",
-                evidence={"assets": unknown, "available": sorted(task_inputs)},
             )
         if len(set(source_ids)) != len(source_ids):
             raise TaskError("INVALID_RECIPE", "Workflow layers must not contain duplicates")
@@ -2027,15 +2622,30 @@ class TaskCoordinator:
             reserved.add(candidate)
             return candidate
 
+        used_step_ids = {row[0] for row in store.db.execute("SELECT id FROM steps")}
+
         def step_id(action, key=""):
             base = "workflow_" + action + ("_" + key if key else "")
-            if len(base) <= 128:
-                return base
-            suffix = hashlib.sha256(base.encode()).hexdigest()[:12]
-            return base[:115] + "_" + suffix
+            if len(base) > 128:
+                suffix = hashlib.sha256(base.encode()).hexdigest()[:12]
+                base = base[:115] + "_" + suffix
+            candidate, number = base, 2
+            while candidate in used_step_ids:
+                suffix = f"_{number}"
+                candidate = base[:128 - len(suffix)] + suffix
+                number += 1
+            used_step_ids.add(candidate)
+            return candidate
 
         loaded = {key: unique_id("map_" + key) for key in source_ids}
         layout_id = declared_layouts[0] if declared_layouts else unique_id("map_layout")
+        service_ids = {
+            key: (unique_id("map_basemap") if key == "__default_basemap__" else key)
+            for key in service_requests
+        }
+        data_loaded = {
+            key: unique_id("map_" + key) for key in data_output_ids
+        } if map_requested else {}
         geometry_types = {}
         for key in source_ids:
             if task_inputs[key]["kind"] == "vector":
@@ -2044,6 +2654,11 @@ class TaskCoordinator:
                 )
                 geometry_types[key] = metadata.get("geometry_type", "")
         recipes = []
+        if (a.get("project") or {}).get("action", "current") != "current":
+            recipes.append((
+                step_id("project"),
+                {"action": "project_setup", "project": a["project"]},
+            ))
         for key in source_ids:
             recipes.append((
                 step_id("load", key),
@@ -2063,19 +2678,107 @@ class TaskCoordinator:
                 elif "Polygon" in geometry_types.get(key, ""):
                     # Keep an enclosing boundary visible without hiding rasters below it.
                     style["color"] = "transparent"
+                if kind == "vector":
+                    style.update({name: value for name, value in
+                                  a.get("vector_styles", {}).get(key, {}).items()
+                                  if value is not None})
                 recipes.append((step_id("style", key), style))
-        recipes.append((
-            step_id("layout"),
-            {
+        for key, service in service_requests.items():
+            recipes.append((
+                step_id("service", service_ids[key]),
+                {"action": "add_basemap", "service": service, "output": service_ids[key]},
+            ))
+        for index, operation in enumerate(a.get("data_operations", []), 1):
+            operation = dict(operation)
+            if operation.get("layer") in loaded:
+                operation["layer"] = loaded[operation["layer"]]
+            recipes.append((
+                step_id("data", f"{index}_{operation['output']}"),
+                {"action": "vector_data", "data_operation": operation},
+            ))
+            if operation["output"] in data_loaded:
+                recipes.append((
+                    step_id("load", operation["output"]),
+                    {"action": "load", "source": f"asset:{operation['output']}",
+                     "output": data_loaded[operation["output"]]},
+                ))
+        for key, service in service_requests.items():
+            logical = service_ids[key]
+            kind = "vector" if service.get("provider") == "wfs" else "raster"
+            styles = a.get(f"{kind}_styles", {})
+            style = styles.get(key) or styles.get(logical)
+            if style:
+                recipes.append((
+                    step_id("style", logical),
+                    {"action": f"style_{kind}", "layer": f"asset:{logical}",
+                     **{name: value for name, value in style.items() if value is not None}},
+                ))
+        for logical in data_output_ids:
+            style = a.get("vector_styles", {}).get(logical)
+            if style and logical in data_loaded:
+                recipes.append((
+                    step_id("style", logical),
+                    {"action": "style_vector", "layer": f"asset:{data_loaded[logical]}",
+                     **{name: value for name, value in style.items() if value is not None}},
+                ))
+        for index, operation in enumerate(a.get("layer_operations", []), 1):
+            operation = dict(operation)
+
+            def workflow_layer_ref(value):
+                return loaded.get(value, service_ids.get(value, data_loaded.get(value, value)))
+
+            if operation.get("layer"):
+                operation["layer"] = workflow_layer_ref(operation["layer"])
+            for field in ("order", "layers"):
+                if operation.get(field):
+                    operation[field] = [workflow_layer_ref(value) for value in operation[field]]
+            recipes.append((
+                step_id("layer", str(index)),
+                {"action": "layer_manage", "layer_operation": operation},
+            ))
+        if a.get("project_update"):
+            recipes.append((
+                step_id("project_update"),
+                {"action": "project_update", "project_update": a["project_update"]},
+            ))
+        if map_requested:
+            thematic_ids = [loaded[key] for key in source_ids]
+            thematic_ids.extend(data_loaded.values())
+            overlay_ids = [
+                service_ids[key] for key, service in service_requests.items()
+                if service.get("role") == "overlay" or service.get("provider") == "wfs"
+            ]
+            basemap_ids = [
+                service_ids[key] for key, service in service_requests.items()
+                if service_ids[key] not in overlay_ids
+            ]
+            if requested_layers:
+                layout_layers = [
+                    loaded.get(key, service_ids.get(key, data_loaded.get(key, key)))
+                    for key in requested_layers
+                ]
+            else:
+                layout_layers = thematic_ids + overlay_ids + basemap_ids
+            recipes.append((
+                step_id("layout"),
+                {
                 "action": "create_layout",
-                "layers": [f"asset:{loaded[key]}" for key in source_ids],
-                "extent_layer": f"asset:{loaded[source_ids[0]]}" if len(source_ids) == 1 else None,
+                "layers": [f"asset:{key}" for key in layout_layers],
+                "extent_layer": f"asset:{thematic_ids[0]}" if len(thematic_ids) == 1 else None,
                 "output": layout_id,
                 "title": a.get("title"),
+                "legend_title": a.get("legend_title"),
+                "map_language": a.get("map_language", "auto"),
+                "show_legend_title": a.get("show_legend_title", True),
+                "north_arrow": a.get("north_arrow", False),
+                "page_orientation": a.get("page_orientation", "auto"),
+                "map_crs": a.get("map_crs"),
+                "map_frame": a.get("map_frame", {}),
                 "coordinate_crs": a.get("coordinate_crs"),
-                "map_element_placement": a.get("map_element_placement", "auto"),
-            },
-        ))
+                "map_elements": a.get("map_elements", {}),
+                "coordinate_annotations": a.get("coordinate_annotations", {}),
+                },
+            ))
         for item in task["deliverables"]:
             if item["kind"] in {"image", "pdf"}:
                 recipes.append((
@@ -2149,7 +2852,12 @@ class TaskCoordinator:
             )
         action = a["action"]
         required = {
+            "project_setup": (),
+            "project_update": ("project_update",),
             "load": ("source", "output"),
+            "add_basemap": ("output",),
+            "layer_manage": ("layer_operation",),
+            "vector_data": ("data_operation",),
             "clip_raster": ("raster", "mask", "output"),
             "clip_vector": ("source", "overlay", "output"),
             "reproject_vector": ("source", "target_crs", "output"),
@@ -2176,6 +2884,34 @@ class TaskCoordinator:
             )
 
         assets = self.assets()
+
+        if action == "project_setup":
+            project = a.get("project")
+            if not project or project.get("action") == "current":
+                raise TaskError("PROJECT_ACTION_REQUIRED", "Choose create or open for project setup")
+            return {
+                "operation": "project",
+                "arguments": {
+                    "action": project["action"], "path": project.get("path"),
+                    "crs": project.get("crs") or "EPSG:4326",
+                    "title": project.get("title") or "Smart-QGIS",
+                },
+                "inputs": [], "outputs": [],
+                "reason": "Create or open the user-requested QGIS project",
+            }
+
+        if action == "project_update":
+            update = a["project_update"]
+            return {
+                "operation": "project",
+                "arguments": {
+                    "action": "update",
+                    "crs": update.get("crs"),
+                    "title": update.get("title"),
+                },
+                "inputs": [], "outputs": [],
+                "reason": "Apply the user-requested project title or display CRS",
+            }
 
         def asset(field, kinds=None):
             reference = a[field]
@@ -2227,6 +2963,26 @@ class TaskCoordinator:
                 )
             return actual
 
+        def layer_reference(reference, kinds=None):
+            if not isinstance(reference, str) or not reference:
+                raise TaskError("INVALID_RECIPE", "A nonempty layer reference is required")
+            key = reference.removeprefix("asset:")
+            if key in assets:
+                if kinds and assets[key]["kind"] not in kinds:
+                    raise TaskError(
+                        "ASSET_KIND_MISMATCH", "Layer reference has the wrong data kind",
+                        evidence={"asset": key, "actual": assets[key]["kind"], "expected": sorted(kinds)},
+                    )
+                if not assets[key].get("layer_id"):
+                    raise TaskError(
+                        "LAYER_NOT_LOADED", "The requested asset is not loaded in the QGIS project",
+                        evidence={"asset": key},
+                    )
+                return f"asset:{key}", key
+            # Exact current-project IDs/names are allowed only because the
+            # server will resolve them uniquely in the checkpointed worker.
+            return reference, None
+
         if action == "load":
             source = asset("source", {"vector", "raster"})
             kind = assets[source]["kind"]
@@ -2240,6 +2996,75 @@ class TaskCoordinator:
                 "inputs": [source],
                 "outputs": [{"id": a["output"], "kind": kind, "binding": "layer"}],
                 "reason": "Load a declared input into the QGIS project",
+            }
+        if action == "add_basemap":
+            service = a.get("service") or {"provider": "openstreetmap"}
+            provider = service.get("provider", "openstreetmap")
+            worker_service = {
+                "openstreetmap": "osm", "xyz": "xyz", "wms": "wms",
+                "wmts": "wmts", "wfs": "wfs",
+            }[provider]
+            kind = "vector" if provider == "wfs" else "raster"
+            return {
+                "operation": "add_basemap",
+                "arguments": {
+                    "service": worker_service, "url": service.get("url"), "uri": service.get("uri"),
+                    "name": service.get("name"), "attribution": service.get("attribution"),
+                    "role": service.get("role"), "layer_name": service.get("layer_name"),
+                    "type_name": service.get("type_name"), "style_name": service.get("style_name"),
+                    "crs": service.get("crs"), "image_format": service.get("image_format", "image/png"),
+                    "version": service.get("version"), "authcfg": service.get("authcfg"),
+                    "zmin": service.get("zmin", 0), "zmax": service.get("zmax", 19),
+                },
+                "inputs": [],
+                "outputs": [{"id": a["output"], "kind": kind, "binding": "layer"}],
+                "reason": "Add the requested remote map layer",
+            }
+        if action == "layer_manage":
+            operation = a["layer_operation"]
+            arguments = {key: value for key, value in operation.items() if value is not None}
+            input_ids = []
+            if operation.get("layer"):
+                arguments["layer"], key = layer_reference(operation["layer"])
+                if key:
+                    input_ids.append(key)
+            for field in ("order", "layers"):
+                if operation.get(field):
+                    resolved = [layer_reference(value) for value in operation[field]]
+                    arguments[field] = [value for value, _key in resolved]
+                    input_ids.extend(key for _value, key in resolved if key)
+            return {
+                "operation": "layers", "arguments": arguments,
+                "inputs": list(dict.fromkeys(input_ids)), "outputs": [],
+                "reason": f"Apply requested layer operation: {operation['action']}",
+            }
+        if action == "vector_data":
+            operation = a["data_operation"]
+            output = operation["output"]
+            output_kind(output, {"vector"})
+            arguments = {
+                "action": {
+                    "export": "export", "create": "create_export", "edit": "edit_export",
+                }[operation["action"]],
+                "path": f"output:{output}",
+                "crs": operation.get("crs"),
+                "selected_only": operation.get("selected_only", False),
+                "expression": operation.get("expression"),
+                "geojson": operation.get("geojson"),
+                "geojson_crs": operation.get("geojson_crs", "EPSG:4326"),
+                "updates": operation.get("updates", []),
+                "name": operation.get("name") or output,
+            }
+            input_ids = []
+            if operation.get("layer"):
+                arguments["layer"], key = layer_reference(operation["layer"], {"vector"})
+                if key:
+                    input_ids.append(key)
+            return {
+                "operation": "vector_data", "arguments": arguments,
+                "inputs": input_ids,
+                "outputs": [{"id": output, "kind": "vector", "binding": "path"}],
+                "reason": f"Create a managed copy for vector {operation['action']}",
             }
         if action == "clip_raster":
             raster, mask = asset("raster", {"raster"}), asset("mask", {"vector"})
@@ -2311,18 +3136,64 @@ class TaskCoordinator:
             kind = "raster" if action == "style_raster" else "vector"
             layer = asset("layer", {kind})
             arguments = {"layer": f"asset:{layer}", "opacity": a["opacity"]}
+            qml_mode = (
+                action == "style_raster" and a.get("mode") == "qml"
+            ) or (
+                action == "style_vector" and a.get("renderer") == "qml"
+            )
+            if qml_mode:
+                qml_id = a.get("qml_asset")
+                if not qml_id or qml_id not in assets or assets[qml_id]["kind"] != "style":
+                    raise TaskError(
+                        "STYLE_ASSET_REQUIRED",
+                        "QML styling requires qml_asset to name a declared style input",
+                        evidence={"qml_asset": qml_id, "available": sorted(assets)},
+                    )
+                return {
+                    "operation": "style_file",
+                    "arguments": {
+                        "action": "load", "layer": f"asset:{layer}",
+                        "path": f"asset:{qml_id}",
+                    },
+                    "inputs": [layer, qml_id],
+                    "reason": f"Load the requested QML presentation for the {kind}",
+                }
             if action == "style_raster":
-                arguments.update(
-                    mode=a.get("mode", "continuous"), ramp=a["ramp"], band=a["band"],
-                    classes=a["classes"], color=a.get("color", "#666666"),
-                    label=a.get("label"),
-                )
+                mode = a.get("mode", "continuous")
+                if mode in {"gray", "rgb", "hillshade"}:
+                    arguments.update(
+                        mode=mode, band=a["band"], red=a.get("red") or 1,
+                        green=a.get("green") or 2, blue=a.get("blue") or 3,
+                        azimuth=a.get("azimuth", 315), altitude=a.get("altitude", 45),
+                        z_factor=a.get("z_factor", 1),
+                    )
+                    operation = "render_raster"
+                else:
+                    arguments.update(
+                        mode=mode, ramp=a["ramp"], band=a["band"], classes=a["classes"],
+                        color=a.get("color", "#666666"), label=a.get("label"),
+                        minimum=a.get("minimum"), maximum=a.get("maximum"),
+                    )
+                    operation = action
             else:
-                arguments.update(
-                    color=a["color"], outline=a["outline"], width=a["width"]
-                )
+                if a.get("renderer") == "graduated":
+                    arguments.update(
+                        field=a.get("graduated_field"), ramp=a["ramp"], classes=a["classes"],
+                        method=a.get("method", "equal_interval"), label_field=a.get("label_field"),
+                    )
+                    operation = "style_graduated"
+                else:
+                    arguments.update(
+                        renderer=a.get("renderer", "single"), color=a["color"],
+                        outline=a["outline"], width=a["width"], size=a["size"],
+                        category_field=a.get("category_field"), categories=a.get("categories"),
+                        rules=a.get("rules"), marker=a.get("marker", "circle"),
+                        line_style=a.get("line_style", "solid"),
+                        label_field=a.get("label_field"),
+                    )
+                    operation = action
             return {
-                "operation": action,
+                "operation": operation,
                 "arguments": arguments,
                 "inputs": [layer],
                 "reason": f"Apply the requested {kind} presentation",
@@ -2377,14 +3248,22 @@ class TaskCoordinator:
                     "action": "create",
                     "name": a["output"],
                     "title": a.get("title") or store.task()["goal"],
+                    "legend_title": a.get("legend_title"),
+                    "map_language": a.get("map_language", "auto"),
+                    "show_legend_title": a.get("show_legend_title", True),
+                    "page_orientation": a.get("page_orientation", "auto"),
+                    "crs": a.get("map_crs"),
+                    "map_frame": a.get("map_frame", {}),
                     "show_title": "title" not in omissions,
                     "layers": [f"asset:{key}" for key in layer_ids],
                     "extent_layer": f"asset:{extent}" if extent else None,
                     "legend": "legend" not in omissions,
                     "scalebar": "scalebar" not in omissions,
+                    "north_arrow": a.get("north_arrow", False) and "north_arrow" not in omissions,
                     "grid": "coordinates" not in omissions,
                     "grid_crs": a.get("coordinate_crs"),
-                    "map_element_placement": a.get("map_element_placement", "auto"),
+                    "map_elements": a.get("map_elements", {}),
+                    "coordinate_annotations": a.get("coordinate_annotations", {}),
                 },
                 "inputs": layer_ids,
                 "outputs": [{
@@ -2500,7 +3379,7 @@ class TaskCoordinator:
             "step_status": "PLANNED",
         })
         result["next_call"] = {
-            "tool": "task_execute",
+            "tool": "step_execute",
             "arguments": {
                 "task_id": a["task_id"],
                 "step_id": a["step_id"],
@@ -2664,7 +3543,7 @@ class TaskCoordinator:
                 "CLARIFICATION_REQUIRED",
                 "Semantic repair limit reached; ask the user before another revised step",
                 evidence={"repairs": len(repairs), "limit": self.correction_limit},
-                next_action="After the user's actual guidance, call task_record_guidance and revise the failed step",
+                next_action="After the user's actual guidance, call task_update and revise the failed step",
             )
         # Required obligations survive repairs, including a switch of algorithm.
         original = records[step.repairs_step]
@@ -2737,7 +3616,13 @@ class TaskCoordinator:
         references = [args[key] for key in ("layer", "extent_layer") if args.get(key)]
         references.extend(args.get("layers") or [])
         references.extend(args.get("order") or [])
-        if any(not ref.startswith("asset:") for ref in references):
+        exact_project_references = {
+            "layers", "vector_data", "style_vector", "style_graduated",
+            "style_raster", "render_raster", "features",
+        }
+        if op not in exact_project_references and any(
+            not ref.startswith("asset:") for ref in references
+        ):
             raise TaskError("DECLARED_INPUT_REQUIRED", "Layer references must use asset:<id>")
         if assets is not None:
             unloaded = sorted({
@@ -2808,11 +3693,6 @@ class TaskCoordinator:
                     evidence={"elements": sorted(not_removed)},
                     next_action="Disable the listed layout elements to match task_contract.map_omissions.",
                 )
-        if op == "project" and args["action"] == "open":
-            raise TaskError(
-                "UNSUPPORTED_SIDE_EFFECT",
-                "Use task_recover; arbitrary external projects are not managed checkpoints",
-            )
         if op == "run_processing":
             if args["algorithm"] == "gdal:cliprasterbymasklayer":
                 clip_boundary_rule(args["parameters"].get("EXTRA"))
@@ -2905,7 +3785,7 @@ class TaskCoordinator:
         writes_path = (
             op == "export_map"
             or (op in {"project", "style_file"} and args["action"] == "save")
-            or (op == "vector_data" and args["action"] == "export")
+            or (op == "vector_data" and args["action"] in {"export", "create_export", "edit_export"})
             or (op == "layout" and args["action"] == "template")
         )
         if writes_path and not (args.get("path") or "").startswith("output:"):
@@ -2972,18 +3852,21 @@ class TaskCoordinator:
         for asset in assets.values():
             if asset.get("layer_id") in by_id:
                 layer = by_id[asset["layer_id"]]
-                if layer["provider"] != "wms":
+                if not asset.get("remote") and layer["provider"] != "wms":
                     asset["path"] = layer["source"].split("|")[0]
             elif asset.get("layer_id"):
                 # Removing a project layer does not delete its durable dataset.
                 # Stop resolving its logical asset to an obsolete runtime ID.
                 asset.pop("layer_id")
         cp["assets"] = assets
+        remote_layer_ids = {
+            item.get("layer_id") for item in assets.values() if item.get("remote")
+        }
         paths = {cp["project"], cp["supplemental"]}
         paths.update(
             layer["source"].split("|")[0]
             for layer in cp["info"]["layers"]
-            if layer["provider"] != "wms"
+            if layer["provider"] != "wms" and layer["id"] not in remote_layer_ids
         )
         paths.update(
             item["path"]
@@ -3205,7 +4088,11 @@ class TaskCoordinator:
                     raise TaskError("OUTPUT_BINDING", "Operation did not return a layer ID")
                 asset.update(layer_id=result["id"], path=result.get("source"))
                 if step.operation == "add_basemap":
-                    asset["remote"] = True
+                    asset.update(
+                        remote=True,
+                        service=step.arguments.get("service"),
+                        role=step.arguments.get("role"),
+                    )
             elif output.kind == "layout":
                 asset["layout"] = result["name"]
             else:
@@ -3231,16 +4118,37 @@ class TaskCoordinator:
     async def run_with_recovery(self, step, assets, directory):
         worker_replays, network_retries = 0, 0
         while True:
-            output_dir = directory / f"execution-{worker_replays}-{network_retries}"
-            output_dir.mkdir()
+            execution_name = f"execution-{worker_replays}-{network_retries}"
+            output_dir = temporary_output_root(self.store.task_id) / directory.name / execution_name
+            output_dir.mkdir(parents=True, exist_ok=False)
             outputs = {
-                out.id: str(output_dir / (out.filename or out.id + EXTENSIONS[out.kind]))
+                out.id: self.output_path(out, output_dir)
                 for out in step.outputs
                 if out.kind != "layout" and out.binding != "layer"
             }
             resolved = self.resolve(step.arguments, assets, outputs)
             try:
-                return await self.bridge.call(step.operation, resolved), outputs
+                result = await self.bridge.call(step.operation, resolved)
+                missing = {
+                    output_id: path for output_id, path in outputs.items()
+                    if not Path(path).is_file()
+                }
+                if missing:
+                    raise TaskError(
+                        "OUTPUT_MISSING",
+                        "Processing did not create a declared output file",
+                        phase="execution",
+                        evidence={
+                            "algorithm": step.arguments.get("algorithm"),
+                            "outputs": missing,
+                            "worker_log": str(result.get("log", ""))[-12000:],
+                        },
+                        next_action=(
+                            "Inspect worker_log and correct the evidenced Processing parameter; "
+                            "do not retry unchanged parameters."
+                        ),
+                    )
+                return result, outputs
             except WorkerError as exc:
                 if exc.code == "WORKER_TIMEOUT":
                     raise
@@ -3272,6 +4180,94 @@ class TaskCoordinator:
                 await self.verify_inputs()
                 await self.restore_committed()
                 await self.require_checks(step.preconditions, assets)
+
+    def output_path(self, output, temporary_directory):
+        """Resolve final destinations only for declared deliverables; intermediates stay temporary."""
+        declared = next(
+            (item for item in self.store.task()["deliverables"] if item["id"] == output.id), None
+        )
+        if declared is None:
+            return str((temporary_directory / (output.filename or output.id + EXTENSIONS[output.kind])).resolve())
+        destination = declared.get("path")
+        if destination is None and declared.get("directory"):
+            destination = str(
+                Path(declared["directory"]) / (output.filename or output.id + EXTENSIONS[output.kind])
+            )
+        if destination is None:
+            return str((temporary_directory / (output.filename or output.id + EXTENSIONS[output.kind])).resolve())
+        path = Path(destination).expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            if self.output_conflict_resolution(path) == "overwrite":
+                if not path.is_file() or path.is_symlink():
+                    raise TaskError(
+                        "UNSAFE_OUTPUT", "Only a regular final-output file may be overwritten",
+                        evidence={"path": str(path)}, next_action="Choose a different output path",
+                    )
+                path.unlink()
+                self.store.event("OUTPUT_OVERWRITTEN", {"path": str(path)})
+                return str(path)
+            raise TaskError(
+                "OUTPUT_EXISTS", "Requested output path already exists",
+                evidence={
+                    "path": str(path),
+                    "question": {
+                        "kind": "output_conflict",
+                        "path": str(path),
+                        "choices": [
+                            {"value": "retry", "description": "I removed the existing file; retry without overwriting."},
+                            {"value": "overwrite", "description": "Replace this exact existing file."},
+                        ],
+                    },
+                    "decision_calls": {
+                        "retry": {
+                            "tool": "task_update",
+                            "arguments": {
+                                "task_id": self.store.task_id,
+                                "instruction": "The user confirmed that this exact file was removed",
+                                "output_conflict": {"path": str(path), "action": "retry"},
+                            },
+                        },
+                        "overwrite": {
+                            "tool": "task_update",
+                            "arguments": {
+                                "task_id": self.store.task_id,
+                                "instruction": "The user explicitly authorized replacement of this exact file",
+                                "output_conflict": {"path": str(path), "action": "overwrite"},
+                            },
+                        },
+                    },
+                },
+                next_action=(
+                    "Ask the user whether this exact file may be replaced. Then call task_update "
+                    "once using the matching evidence.decision_calls entry; it will resume only "
+                    "the failed operation and return task_execute."
+                ),
+            )
+        return str(path)
+
+    def output_conflict_resolution(self, path):
+        """Return the latest explicit user decision for this exact output path."""
+        target = str(Path(path).expanduser().resolve())
+        rows = self.store.db.execute(
+            "SELECT kind,body FROM events WHERE kind IN "
+            "('OUTPUT_CONFLICT_RESOLUTION','ATTEMPT_FAILED') ORDER BY sequence DESC"
+        )
+        for row in rows:
+            body = json.loads(row["body"])
+            if row["kind"] == "OUTPUT_CONFLICT_RESOLUTION":
+                if body.get("path") == target:
+                    return body.get("action")
+                continue
+            failure = body.get("failure") or {}
+            if (
+                failure.get("code") == "OUTPUT_EXISTS"
+                and (failure.get("evidence") or {}).get("path") == target
+            ):
+                # An older decision cannot authorize a new conflict.  This is
+                # especially important for retry after the file remained.
+                return None
+        return None
 
     async def check(self, check, assets):
         # Wall time includes Worker transport. Keep it with the local validation
@@ -3400,10 +4396,16 @@ class TaskCoordinator:
             ).fetchone()
             allowed = {"FILESYSTEM_ERROR", "WORKER_UNAVAILABLE", "INTERRUPTED", "CANCELLED",
                        "INPUT_REVISION_INTERRUPTED"}
+            failure = json.loads(attempt["failure"] or "{}") if attempt else {}
+            output_resolution = None
+            if failure.get("code") == "OUTPUT_EXISTS":
+                output_resolution = self.output_conflict_resolution(
+                    (failure.get("evidence") or {}).get("path", "")
+                )
             if (not row or row["status"] != "FAILED" or not attempt or attempt["status"] != "FAILED"
-                    or json.loads(attempt["failure"] or "{}").get("code") not in allowed):
+                    or (failure.get("code") not in allowed and output_resolution not in {"retry", "overwrite"})):
                 raise TaskError("SEMANTIC_REPAIR_REQUIRED", "Only infrastructure failures can retry an unchanged contract",
-                                next_action="Submit a revised step with repairs_step for parameter or validation failures")
+                                next_action="Submit a revised step with repairs_step for parameter or validation failures; OUTPUT_EXISTS requires recorded user output-conflict guidance")
             if row["contract_version"] != store.task()["contract_version"]:
                 raise TaskError("CONTRACT_CONFLICT", "The failed step contract is outdated")
             retries = sum(json.loads(event[0]).get("step_id") == retry_step for event in
@@ -3466,12 +4468,12 @@ class TaskCoordinator:
             if result["intervention_reason"] == "tool_timeout":
                 result["next_action"] = (
                     "A tool call timed out. Inspect the task and ask the user whether to retry, "
-                    "repair, or stop; record the actual response with task_record_guidance or task_answer."
+                    "repair, or stop; record the actual response with task_update or task_answer."
                 )
             else:
                 result["next_action"] = (
                     "The correction limit was reached. Explain the latest failure and ask the user "
-                    "how to proceed; record the actual response with task_record_guidance or task_answer."
+                    "how to proceed; record the actual response with task_update or task_answer."
                 )
             return result
         if not retry_step and self.presentation_pending():
@@ -3480,11 +4482,11 @@ class TaskCoordinator:
                 "arguments": {"task_id": store.task_id,
                               "continuation_token": result["continuation_token"]},
             })
-            result["next_action"] = "Call task_execute_next with next_call.arguments to resume the pending map"
+            result["next_action"] = "Call task_execute with next_call.arguments to resume the pending map"
         if retry_step:
             result["continuation_token"] = self.issue_continuation("execute", retry_step)
             result["next_call"] = {
-                "tool": "task_execute",
+                "tool": "step_execute",
                 "arguments": {
                     "task_id": store.task_id,
                     "step_id": retry_step,

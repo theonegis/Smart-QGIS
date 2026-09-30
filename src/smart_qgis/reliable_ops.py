@@ -339,7 +339,8 @@ def dispatch(engine, operation, arguments):
     operations = {
         "_environment": lambda a: environment(engine),
         "_validate_crs": lambda a: {
-            "valid": QgsCoordinateReferenceSystem(a["value"]).isValid()
+            "valid": QgsCoordinateReferenceSystem(a["value"]).isValid(),
+            "geographic": QgsCoordinateReferenceSystem(a["value"]).isGeographic(),
         },
         "_inspect": lambda a: inspect(engine, a),
         "_processing_preflight": engine.processing_preflight,

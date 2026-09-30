@@ -13,6 +13,7 @@ from qgis.core import (
     QgsLayoutItemLabel,
     QgsLayoutItemLegend,
     QgsLayoutItemMap,
+    QgsLayoutItemPicture,
     QgsLayoutItemScaleBar,
     QgsLegendSettings,
     QgsRasterLayer,
@@ -386,6 +387,9 @@ def layout_content(layout, check):
               if isinstance(item, QgsLayoutItemScaleBar) and exported(item)
               and item.linkedMap() == map_item
               and item.unitsPerSegment() > 0 and item.numberOfSegments() > 0]
+    north_arrows = [item for item in layout.items()
+                    if isinstance(item, QgsLayoutItemPicture) and exported(item)
+                    and item.id() == "map-north-arrow"]
     valid_grids = [
         grid
         for grid in map_item.grids().asList()
@@ -403,22 +407,118 @@ def layout_content(layout, check):
     grid_ok = bool(valid_grids) if check.get("require_grid") else True
     if expected is not None:
         grid_ok = expected.isValid() and any(grid.crs() == expected for grid in valid_grids)
+    items = {
+        "title": title,
+        "legend": legends[0] if legends else None,
+        "scalebar": scales[0] if scales else None,
+        "north_arrow": north_arrows[0] if north_arrows else None,
+    }
+    requested_placements = check.get("element_placements", {})
+    resolved_placements = {}
+    placement_matches = {}
+
+    def physical_placement_matches(item, requested):
+        frame, anchor = requested.get("frame"), requested.get("anchor")
+        if frame is None and anchor is None:
+            return True
+        x, y = item.positionWithUnits().x(), item.positionWithUnits().y()
+        width, height = item.sizeWithUnits().width(), item.sizeWithUnits().height()
+        map_x, map_y = map_item.positionWithUnits().x(), map_item.positionWithUnits().y()
+        map_width, map_height = map_item.sizeWithUnits().width(), map_item.sizeWithUnits().height()
+        map_right, map_bottom = map_x + map_width, map_y + map_height
+        inside = x >= map_x and y >= map_y and x + width <= map_right and y + height <= map_bottom
+        if frame == "inside" and not inside:
+            return False
+        if frame == "outside" and x < map_right and x + width > map_x and y < map_bottom and y + height > map_y:
+            return False
+        if anchor is None:
+            return True
+        center_x, center_y = x + width / 2, y + height / 2
+        if anchor.startswith("top") and not (y + height <= map_y if frame == "outside" else center_y <= map_y + map_height / 3):
+            return False
+        if anchor.startswith("bottom") and not (y >= map_bottom if frame == "outside" else center_y >= map_y + map_height * 2 / 3):
+            return False
+        if anchor.endswith("left") or anchor == "left":
+            if not (center_x <= map_x + map_width / 2 if frame == "outside" else center_x <= map_x + map_width / 3):
+                return False
+        if anchor.endswith("right") or anchor == "right":
+            if not (center_x >= map_x + map_width / 2 if frame == "outside" else center_x >= map_x + map_width * 2 / 3):
+                return False
+        return True
+
+    for name, requested in requested_placements.items():
+        item = items.get(name)
+        actual = (
+            {"frame": item.customProperty("smart-qgis:frame"),
+             "anchor": item.customProperty("smart-qgis:anchor")}
+            if item is not None else None
+        )
+        resolved_placements[name] = actual
+        placement_matches[name] = bool(
+            actual
+            and all(value is None or actual.get(key) == value for key, value in requested.items())
+            and physical_placement_matches(item, requested)
+        )
+    visible_items = {name: item for name, item in items.items() if item is not None and exported(item)}
+
+    def rectangle(item):
+        x, y = item.positionWithUnits().x(), item.positionWithUnits().y()
+        return (x, y, x + item.sizeWithUnits().width(), y + item.sizeWithUnits().height())
+
+    def overlaps(first, second, tolerance=0.5):
+        a, b = rectangle(first), rectangle(second)
+        return (
+            min(a[2], b[2]) - max(a[0], b[0]) > tolerance
+            and min(a[3], b[3]) - max(a[1], b[1]) > tolerance
+        )
+
+    element_overlaps = []
+    names = list(visible_items)
+    for index, name in enumerate(names):
+        for other in names[index + 1:]:
+            if overlaps(visible_items[name], visible_items[other]):
+                element_overlaps.append([name, other])
+    outside_map_overlaps = [
+        name for name, item in visible_items.items()
+        if item.customProperty("smart-qgis:frame") == "outside" and overlaps(item, map_item)
+    ]
+    no_element_overlap = not element_overlaps and not outside_map_overlaps
+    page_size = layout.pageCollection().pages()[0].pageSize()
+    page_coverage = (
+        (map_item.sizeWithUnits().width() * map_item.sizeWithUnits().height())
+        / (page_size.width() * page_size.height())
+    )
+    minimum_coverage = check.get("min_page_coverage")
+    coverage_ok = minimum_coverage is None or page_coverage >= minimum_coverage
     passed = (
         not missing
         and (not check.get("require_title") or title_ok)
         and (not check.get("require_legend") or bool(legends))
         and (not check.get("require_scalebar") or bool(scales))
+        and (not check.get("require_north_arrow") or bool(north_arrows))
         and grid_ok
+        and all(placement_matches.values())
+        and no_element_overlap
+        and coverage_ok
     )
     return passed, {
         "missing_texts": missing,
         "title_present": title_ok,
         "linked_visible_legends": len(legends),
         "linked_visible_scalebars": len(scales),
+        "visible_north_arrows": len(north_arrows),
         "annotated_coordinate_grids": len(valid_grids),
         "grid_matches": grid_ok,
+        "resolved_element_placements": resolved_placements,
+        "placement_matches": placement_matches,
+        "element_overlaps": element_overlaps,
+        "outside_elements_overlapping_map": outside_map_overlaps,
+        "elements_do_not_overlap": no_element_overlap,
+        "map_frame_page_coverage": round(page_coverage, 4),
+        "minimum_page_coverage": minimum_coverage,
+        "coverage_matches": coverage_ok,
         "method": "Title/legend/scale export visibility and annotated coordinate-grid validity",
-        "limits": "Does not prove rendered text legibility, absence of overlap, scale calibration or cartographic quality",
+        "limits": "Does not prove rendered text legibility, scale calibration or subjective cartographic quality",
     }
 
 

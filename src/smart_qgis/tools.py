@@ -7,16 +7,18 @@ from typing import Any, Literal
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, ConfigDict, Field
 
+from .contracts import CoordinateAnnotations, MapElements, MapFrame
+
 
 class Arguments(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
 
 class Project(Arguments):
-    action: Literal["info", "create", "open", "save"] = "info"
+    action: Literal["info", "create", "open", "save", "update"] = "info"
     path: str | None = None
-    crs: str = "EPSG:4326"
-    title: str = "Smart-QGIS"
+    crs: str | None = None
+    title: str | None = None
     overwrite: bool = Field(
         False,
         description="Replace an existing project file at the requested managed output path",
@@ -33,30 +35,43 @@ class Load(Arguments):
 
 
 class Basemap(Arguments):
-    service: Literal["osm", "google", "xyz", "wms", "wmts"] = "osm"
+    service: Literal["osm", "google", "xyz", "wms", "wmts", "wfs"] = "osm"
     url: str | None = Field(
         None,
         description="XYZ template or full QGIS WMS/WMTS provider URI. Optional override for Google presets.",
     )
     name: str | None = None
     attribution: str | None = None
+    uri: str | None = None
+    role: Literal["basemap", "overlay"] = "basemap"
+    layer_name: str | None = None
+    type_name: str | None = None
+    style_name: str | None = None
+    crs: str | None = None
+    image_format: str = "image/png"
+    version: str | None = None
+    authcfg: str | None = None
     google_style: Literal["roadmap", "terrain", "satellite"] = "roadmap"
     zmin: int = Field(0, ge=0, le=30)
     zmax: int = Field(19, ge=0, le=30)
 
 
 class Layers(Arguments):
-    action: Literal["list", "rename", "remove", "visibility", "order"] = "list"
+    action: Literal["list", "rename", "remove", "visibility", "opacity", "order", "group"] = "list"
     layer: str | None = Field(None, description="Exact layer ID or unique name")
     name: str | None = None
     visible: bool = True
-    order: list[str] | None = Field(None, description="All layer IDs/names, topmost first")
+    opacity: float | None = Field(None, ge=0, le=1)
+    order: list[str] | None = Field(None, description="Requested layer subset, topmost first")
+    layers: list[str] | None = Field(None, description="Layers to move into the named group")
 
 
 class Features(Arguments):
     layer: str
+    action: Literal["sample", "statistics"] = "sample"
     limit: int = Field(10, ge=1, le=100)
     expression: str | None = Field(None, description="Optional QGIS filter expression")
+    field: str | None = Field(None, description="Existing numeric field for statistics")
 
 
 class VectorStyle(Arguments):
@@ -70,6 +85,13 @@ class VectorStyle(Arguments):
     categories: list[dict[str, Any]] | None = Field(
         None, description="Objects with value, color, optional label"
     )
+    renderer: Literal["single", "categorized", "rule_based"] = "single"
+    rules: list[dict[str, Any]] | None = Field(
+        None,
+        description="Rule objects with expression, label, color, outline, width and size",
+    )
+    marker: Literal["circle", "square", "triangle", "diamond", "cross", "cross2"] = "circle"
+    line_style: Literal["solid", "dash", "dot", "dash_dot", "dash_dot_dot"] = "solid"
     label_field: str | None = None
 
 
@@ -93,7 +115,10 @@ class Algorithms(Arguments):
     )
     query: str = Field(
         "",
-        description="For action=list only: one or two space-separated keywords; every word must match",
+        description=(
+            "For action=list only: one to three discriminating keywords. Results are ranked but every "
+            "word must match. A miss returns bounded suggestions, never an automatically selected algorithm"
+        ),
     )
     algorithm: str | None = Field(
         None,
@@ -102,7 +127,7 @@ class Algorithms(Arguments):
     provider: str | None = Field(None, description="Exact provider ID filter for list, e.g. native or gdal")
     group: str | None = Field(None, description="Exact group ID filter for list; returned in list entries")
     offset: int = Field(0, ge=0, description="For action=list only: zero-based result offset")
-    limit: int = Field(30, ge=1, le=200, description="For action=list only: maximum results; keep small")
+    limit: int = Field(12, ge=1, le=200, description="For action=list only: maximum results; keep small")
     include_details: bool = Field(
         False,
         description=(
@@ -139,11 +164,31 @@ class Layout(Arguments):
     crs: str | None = None
     width_mm: float = Field(210, ge=100, le=1000)
     height_mm: float = Field(297, ge=100, le=1000)
+    page_orientation: Literal["auto", "portrait", "landscape"] = Field(
+        "auto", description="auto selects a compact page orientation from the thematic extent"
+    )
     legend: bool = True
+    legend_title: str | None = Field(
+        None, description="Reader-facing legend heading; null uses a language-aware default"
+    )
+    map_language: Literal["auto", "zh", "en"] = Field(
+        "auto", description="Language for server-generated map text; auto follows the title"
+    )
+    show_legend_title: bool = True
     scalebar: bool = True
+    north_arrow: bool = Field(False, description="Add a north arrow only when the user explicitly requests one")
     grid: bool = True
-    map_element_placement: Literal["auto", "inside", "outside"] = Field(
-        "auto", description="Place legend and scale bar inside available map-frame space or outside when they do not fit"
+    map_elements: MapElements = Field(
+        default_factory=MapElements,
+        description="Optional independent positions for legend, scale bar, north arrow and title; omitted fields are server-resolved",
+    )
+    map_frame: MapFrame = Field(
+        default_factory=MapFrame,
+        description="Map-frame sizing; auto creates a compact page from the thematic data",
+    )
+    coordinate_annotations: CoordinateAnnotations = Field(
+        default_factory=CoordinateAnnotations,
+        description="Optional coordinate-label map-frame sides; omit for server choice",
     )
     grid_crs: str | None = Field(
         None,
@@ -179,22 +224,22 @@ SPECS = [
     (
         "add_basemap",
         Basemap,
-        "Add OSM, authorized Google XYZ tiles, custom XYZ, WMS or WMTS. Remote imagery requires network access. Google supports roadmap, terrain and satellite presets or a custom URL.",
+        "Add OSM, authorized Google/custom XYZ, WMS, WMTS or WFS. WFS is a vector overlay; image/tile services default to basemap. Exact endpoints, layer/type names and authcfg values must come from the user or service documentation.",
     ),
     (
         "layer_manage",
         Layers,
-        "List, rename, remove, reorder or show/hide layers. Order is topmost first; names must be unique, IDs are preferred.",
+        "List, rename, remove, reorder, group, change opacity or show/hide layers. A requested order may be a topmost subset; exact IDs are preferred over names.",
     ),
     (
         "feature_info",
         Features,
-        "Inspect a bounded GeoJSON feature sample and attributes, optionally filtered by a QGIS expression.",
+        "Read a bounded GeoJSON feature/attribute sample or full matching-field numeric statistics, optionally filtered by a verified QGIS expression.",
     ),
     (
         "style_vector",
         VectorStyle,
-        "Style point, line or polygon data, optionally categorized with labels. For transparent polygons set color='transparent'. Width and size are millimetres.",
+        "Style point, line or polygon data with single, categorized or rule-based rendering, marker/line patterns and optional labels. Rule expressions and fields must be verified first. Width and size are millimetres.",
     ),
     (
         "style_raster",
@@ -204,7 +249,7 @@ SPECS = [
     (
         "algorithm_info",
         Algorithms,
-        "Read-only Processing registry lookup after task_start (or task_recover). Use list once with 1-2 keywords, then help once for the chosen exact provider:algorithm ID. Stop searching after help identifies a suitable algorithm; prepare_algorithm performs the live preflight.",
+        "Read-only indexed Processing lookup after task_start (or task_resume). Search once with 1-3 discriminating keywords and optional provider/group filters. Results are relevance-ranked; suggestions after a miss are candidates only. Use help once for the chosen exact provider:algorithm ID, then stop searching and call prepare_algorithm for live preflight.",
     ),
     (
         "processing_execute",
@@ -214,7 +259,7 @@ SPECS = [
     (
         "layout_manage",
         Layout,
-        "Create/manage a printable map document with title, legend, scale bar and WGS84 graticule, or save it as QPT. Saved projects retain layouts. extent_layer avoids global basemap extents.",
+        "Create/manage a printable map document with title, legend, scale bar and coordinate annotations, or save it as QPT. The default adaptive page maximizes the thematic map without excessive blank space. Saved projects retain layouts. extent_layer avoids global basemap extents.",
     ),
     (
         "export_map",
@@ -262,9 +307,17 @@ def build_tools(bridge, *, compact=False):
 
             return invoke
 
+        operation = WORKER_OPERATIONS.get(name, name)
+        if compact and name == "task_resume":
+            operation = "task_recover"
+        elif compact and name == "project_info":
+            operation = "project"
+        elif compact and name == "data_info":
+            operation = "inspect_data"
+
         tools.append(
             StructuredTool.from_function(
-                coroutine=bind(WORKER_OPERATIONS.get(name, name), schema),
+                coroutine=bind(operation, schema),
                 name=name,
                 description=description,
                 args_schema=schema,
@@ -281,15 +334,20 @@ class StyleFile(Arguments):
 
 
 class VectorData(Arguments):
-    action: Literal["select", "clear_selection", "export", "create", "statistics"]
+    action: Literal[
+        "select", "clear_selection", "export", "create", "statistics",
+        "create_export", "edit_export",
+    ]
     layer: str | None = None
     expression: str | None = None
     field: str | None = None
     path: str | None = None
     name: str = "Features"
-    crs: str = "EPSG:4326"
+    crs: str | None = None
     geojson: dict[str, Any] | None = Field(None, description="GeoJSON FeatureCollection for create")
     selected_only: bool = False
+    updates: list[dict[str, Any]] | None = None
+    geojson_crs: str = "EPSG:4326"
     overwrite: bool = False
 
 
@@ -310,8 +368,10 @@ class GraduatedStyle(Arguments):
     layer: str
     field: str
     ramp: str = "Viridis"
-    classes: int = Field(5, ge=2, le=20)
+    classes: int = Field(5, ge=2, le=100)
     method: Literal["equal_interval", "quantile", "jenks"] = "quantile"
+    opacity: float = Field(1, ge=0, le=1)
+    label_field: str | None = None
 
 
 SPECS.extend(

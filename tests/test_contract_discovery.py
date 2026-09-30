@@ -17,7 +17,7 @@ from smart_qgis.tools import build_tools
 def test_reliable_tool_surface_hides_direct_mutations(tmp_path):
     coordinator = TaskCoordinator(root=tmp_path)
     names = {tool.name for tool in build_tools(coordinator)}
-    assert {"algorithm_info", "layer_info", "step_prepare", "workflow_run", "task_execute"} <= names
+    assert {"algorithm_info", "layer_info", "step_prepare", "workflow_run", "step_execute"} <= names
     assert not {
         "project_manage",
         "load_data",
@@ -33,17 +33,56 @@ def test_compact_reliable_surface_has_processing_discovery_and_typed_preparation
     coordinator = TaskCoordinator(root=tmp_path)
     names = {tool.name for tool in build_tools(coordinator, compact=True)}
     assert names == {
-        "algorithm_info", "task_start", "task_execute_next", "task_answer", "task_record_guidance", "task_invalidate", "task_recover", "task_diagnose",
-        "prepare_algorithm",
+        "project_info", "data_info", "algorithm_info", "task_start", "task_execute",
+        "task_answer", "task_update", "task_resume", "task_diagnose", "task_restart",
+        "task_stop", "prepare_algorithm",
     }
     schemas = {
         tool.name: tool.args_schema.model_json_schema()
         for tool in build_tools(coordinator, compact=True)
     }
-    assert schemas["task_execute_next"].get("properties", {}) == {}
-    assert schemas["task_execute_next"].get("required", []) == []
-    assert schemas["task_execute_next"]["additionalProperties"] is False
-    assert "repairs_step" in schemas["prepare_algorithm"]["properties"]
+    assert schemas["task_execute"].get("properties", {}) == {}
+    assert schemas["task_execute"].get("required", []) == []
+    assert schemas["task_execute"]["additionalProperties"] is False
+    assert "step_id" not in schemas["prepare_algorithm"]["properties"]
+    assert "repairs_step" not in schemas["prepare_algorithm"]["properties"]
+    assert "retry_step" not in schemas["task_resume"]["properties"]
+    assert "continuation_token" not in schemas["task_resume"]["properties"]
+    assert "basemap" in schemas["task_start"]["properties"]
+    assert schemas["task_start"]["properties"]["overwrite_existing_outputs"]["default"] is False
+    assert "basemap" in schemas["task_update"]["properties"]
+    assert "output_conflict" in schemas["task_update"]["properties"]
+
+
+def test_published_schema_drops_generated_titles_but_keeps_field_guidance(tmp_path):
+    coordinator = TaskCoordinator(root=tmp_path)
+    raw = {
+        tool.name: tool.args_schema.model_json_schema()
+        for tool in build_tools(coordinator, compact=True)
+    }
+    published = {
+        name: mcp_server.compact_published_schema(schema)
+        for name, schema in raw.items()
+    }
+    def generated_titles(value, path=()):
+        found = []
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key == "title" and (not path or path[-1] != "properties"):
+                    found.append((*path, key))
+                found.extend(generated_titles(child, (*path, key)))
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                found.extend(generated_titles(child, (*path, index)))
+        return found
+
+    encoded = json.dumps(published, ensure_ascii=False, separators=(",", ":"))
+    assert not generated_titles(published)
+    assert len(encoded) < 45_000
+    assert "title" in published["task_start"]["properties"]
+    assert published["task_start"]["properties"]["map_language"]["default"] == "auto"
+    assert published["task_start"]["properties"]["inputs"]["description"]
+    assert published["algorithm_info"]["properties"]["query"]["description"]
 
 
 @pytest.mark.parametrize(("option", "expected"), [
@@ -224,7 +263,7 @@ def test_maps_default_to_title_legend_scale_and_coordinate_annotations():
     assert not omitted[0].require_grid
     _, none = family_checks(
         step,
-        map_omissions={"title", "legend", "scalebar", "coordinates"},
+            map_omissions={"title", "legend", "scalebar", "north_arrow", "coordinates"},
     )
     assert none == []
 

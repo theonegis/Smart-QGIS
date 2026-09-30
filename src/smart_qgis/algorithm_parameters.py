@@ -340,12 +340,27 @@ def normalize_supplied_value(parameter: AlgorithmParameter, value: Any) -> Any:
     This deliberately fixes representation errors only.  It never selects a
     missing CRS, field, enum, expression, band, or scientific value.
     """
+    kind = parameter.type.casefold()
+    # QGIS presents raster bands to people as labels such as ``Band_1``, while
+    # some Processing providers (notably GDAL) accept only their one-based
+    # numeric index.  This is an unambiguous representation conversion, not a
+    # choice of band.  Do it before enum handling because provider help can
+    # expose those labels as choices on some QGIS versions.
+    if kind == "band":
+        values = value if parameter.multiple and isinstance(value, list) else [value]
+        normalized = []
+        for item in values:
+            if isinstance(item, str):
+                match = re.fullmatch(r"(?:band[\s_-]*)?([1-9][0-9]*)", item.strip(), re.IGNORECASE)
+                normalized.append(int(match.group(1)) if match else item)
+            else:
+                normalized.append(item)
+        return normalized if parameter.multiple else normalized[0]
     if parameter.multiple and parameter.choices:
         values = value if isinstance(value, list) else [value]
         return [_choice_value(parameter, item) for item in values]
     if parameter.choices:
         return _choice_value(parameter, value)
-    kind = parameter.type.casefold()
     if kind == "matrix":
         return _normalize_matrix(value)
     if not isinstance(value, str):

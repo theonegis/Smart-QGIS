@@ -16,7 +16,7 @@ Smart-QGIS 的默认 `reliable` 模式把 GIS 修改操作放入有状态任务�
 MCP 客户端（模型、对话、审批）
        │
        ▼
-task_start / prepare_algorithm / task_execute_next
+task_start / prepare_algorithm / task_execute
        │
        ▼
 任务协调器 ── SQLite 日志、逻辑资产、检查点
@@ -28,9 +28,9 @@ task_start / prepare_algorithm / task_execute_next
 产物基础校验 → 提交，或保存错误供同任务修复
 ```
 
-`task_start` 锁定最小任务目标与输入；标准工作流和已批准计划的下一动作由服务端持有，客户端只调用无参数 `task_execute_next`。通用 Processing 使用精确算法 ID 调用 `prepare_algorithm`，按实时帮助规范化参数并创建一步执行计划。工作流按步骤增量推进，成功后保存检查点。
+`task_start` 锁定最小任务目标与输入；标准工作流和已批准计划的下一动作由服务端持有，客户端只调用无参数 `task_execute`。通用 Processing 使用精确算法 ID 调用 `prepare_algorithm`，按实时帮助规范化参数并创建一步执行计划。工作流按步骤增量推进，成功后保存检查点。
 
-失败但未提交的步骤可以重新准备；已提交但经证实错误的产物先失效，再替换生产步骤。失效保留旧尝试证据，避免把错误产物当成当前结果。服务重启后以原任务 ID `task_recover`；`task_diagnose` 只读，不执行也不恢复。相同回答与已提交动作的重发具有幂等保护；不要手工改 SQLite、虚构用户回答或另建任务来掩盖失败。
+失败但未提交的步骤可以重新准备；已提交但经证实错误的产物先失效，再替换生产步骤。失效保留旧尝试证据，避免把错误产物当成当前结果。服务重启后以原任务 ID 调用 `task_resume`；`task_diagnose` 只读，不执行也不恢复。相同回答与已提交动作的重发具有幂等保护；不要手工改 SQLite、虚构用户回答或另建任务来掩盖失败。
 
 每个任务目录含 SQLite 与相关检查点/产物。服务启动时自动清理已完成或取消且超过 10 天、阻塞且超过 60 天的整任务目录；活跃/待答/持锁任务不清理。期限可通过启动参数调整，`0` 关闭对应类别的清理。
 

@@ -144,6 +144,7 @@ def family_checks(step, defaults=None, *, map_omissions=()):
             "require_title": "title" not in omissions,
             "require_legend": "legend" not in omissions,
             "require_scalebar": "scalebar" not in omissions,
+            "require_north_arrow": "north_arrow" not in omissions and step.arguments.get("north_arrow", False),
             "require_grid": "coordinates" not in omissions,
         }
         if any(required.values()):
@@ -158,6 +159,15 @@ def family_checks(step, defaults=None, *, map_omissions=()):
                         if required["require_grid"]
                         else None
                     ),
+                    element_placements={
+                        name: {
+                            key: value[key] for key in ("frame", "anchor")
+                            if value.get(key) is not None
+                        }
+                        for name, value in (step.arguments.get("map_elements") or {}).items()
+                        if value and any(value.get(key) is not None for key in ("frame", "anchor"))
+                    },
+                    min_page_coverage=(step.arguments.get("map_frame") or {}).get("min_page_coverage"),
                 )
 
     return pre, post

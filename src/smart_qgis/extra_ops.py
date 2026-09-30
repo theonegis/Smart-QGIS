@@ -9,7 +9,9 @@ from qgis.core import (
     QgsClassificationJenks,
     QgsClassificationQuantile,
     QgsContrastEnhancement,
+    QgsCoordinateTransform,
     QgsExpression,
+    QgsFeature,
     QgsFeatureRequest,
     QgsGraduatedSymbolRenderer,
     QgsHillshadeRenderer,
@@ -40,19 +42,82 @@ def style_file(engine, a, destination):
 
 def vector_data(engine, a, destination, crs):
     action = a["action"]
-    if action == "create":
+    if action in {"create", "create_export"}:
         data = a.get("geojson")
         if not data or data.get("type") != "FeatureCollection":
             raise ValueError("geojson must be a FeatureCollection")
-        source = QgsVectorLayer(json.dumps(data), a["name"], "ogr")
+        source = QgsVectorLayer(json.dumps(data), a.get("name") or "Features", "ogr")
         if not source.isValid():
             raise ValueError("Invalid GeoJSON")
         layer = source.materialize(QgsFeatureRequest())
-        layer.setName(a["name"])
-        layer.setCrs(crs(a["crs"]))
-        engine.project.addMapLayer(layer)
-        return engine.layer_info(layer)
-    layer = engine.resolve(a.get("layer"), QgsVectorLayer)
+        layer.setName(a.get("name") or "Features")
+        layer.setCrs(crs(a.get("crs") or a.get("geojson_crs") or "EPSG:4326"))
+        if action == "create":
+            engine.project.addMapLayer(layer)
+            return engine.layer_info(layer)
+    elif action == "edit_export":
+        source = engine.resolve(a.get("layer"), QgsVectorLayer)
+        layer = source.materialize(QgsFeatureRequest())
+        layer.setName(a.get("name") or source.name())
+        source_features = list(source.getFeatures())
+        copied_features = list(layer.getFeatures())
+        feature_ids = {
+            original.id(): copied.id()
+            for original, copied in zip(source_features, copied_features, strict=True)
+        }
+        delete_expression = a.get("expression")
+        if delete_expression:
+            expression = QgsExpression(delete_expression)
+            if expression.hasParserError():
+                raise ValueError(expression.parserErrorString())
+            delete_ids = [feature.id() for feature in layer.getFeatures(
+                QgsFeatureRequest().setFilterExpression(delete_expression)
+            )]
+            if delete_ids and not layer.dataProvider().deleteFeatures(delete_ids):
+                raise ValueError("Failed to delete matching features from the copied layer")
+        for update in a.get("updates") or []:
+            source_feature_id = update.get("feature_id")
+            feature_id = feature_ids.get(source_feature_id)
+            feature = (
+                next(layer.getFeatures(QgsFeatureRequest(feature_id)), None)
+                if feature_id is not None else None
+            )
+            if feature is None:
+                raise ValueError(f"Unknown feature_id: {source_feature_id}")
+            changes = {}
+            for field, value in (update.get("attributes") or {}).items():
+                index = layer.fields().indexFromName(field)
+                if index < 0:
+                    raise ValueError(f"Unknown field in update: {field}")
+                changes[index] = value
+            if changes and not layer.dataProvider().changeAttributeValues({feature_id: changes}):
+                raise ValueError(f"Failed to update feature_id: {source_feature_id}")
+        additions = a.get("geojson")
+        if additions:
+            if additions.get("type") != "FeatureCollection":
+                raise ValueError("geojson additions must be a FeatureCollection")
+            incoming = QgsVectorLayer(json.dumps(additions), "additions", "ogr")
+            if not incoming.isValid():
+                raise ValueError("Invalid GeoJSON additions")
+            incoming.setCrs(crs(a.get("geojson_crs") or "EPSG:4326"))
+            transform = QgsCoordinateTransform(incoming.crs(), layer.crs(), engine.project)
+            new_features = []
+            for item in incoming.getFeatures():
+                feature = QgsFeature(layer.fields())
+                feature.setAttributes([
+                    item[field.name()] if incoming.fields().indexFromName(field.name()) >= 0 else None
+                    for field in layer.fields()
+                ])
+                if item.hasGeometry():
+                    geometry = item.geometry()
+                    geometry.transform(transform)
+                    feature.setGeometry(geometry)
+                new_features.append(feature)
+            if new_features and not layer.dataProvider().addFeatures(new_features)[0]:
+                raise ValueError("Failed to append GeoJSON features to the copied layer")
+        layer.updateExtents()
+    else:
+        layer = engine.resolve(a.get("layer"), QgsVectorLayer)
     if action == "clear_selection":
         layer.removeSelection()
         return {"selected": 0}
@@ -88,6 +153,11 @@ def vector_data(engine, a, destination, crs):
             "sum": total,
             "mean": total / count if count else None,
         }
+    if action == "export" and a.get("expression"):
+        expression = QgsExpression(a["expression"])
+        if expression.hasParserError():
+            raise ValueError(expression.parserErrorString())
+        layer = layer.materialize(QgsFeatureRequest().setFilterExpression(a["expression"]))
     path = destination(a.get("path"), [".gpkg", ".geojson", ".shp"], a.get("overwrite", False))
     options = QgsVectorFileWriter.SaveVectorOptions()
     options.driverName = {".gpkg": "GPKG", ".geojson": "GeoJSON", ".shp": "ESRI Shapefile"}[
@@ -95,15 +165,18 @@ def vector_data(engine, a, destination, crs):
     ]
     options.fileEncoding = "UTF-8"
     options.onlySelectedFeatures = a.get("selected_only", False)
-    from qgis.core import QgsCoordinateTransform
-
-    options.ct = QgsCoordinateTransform(layer.crs(), crs(a["crs"]), engine.project)
+    target_crs = a.get("crs") or layer.crs().authid()
+    options.ct = QgsCoordinateTransform(layer.crs(), crs(target_crs), engine.project)
     result = QgsVectorFileWriter.writeAsVectorFormatV3(
         layer, path, engine.project.transformContext(), options
     )
     if result[0] != QgsVectorFileWriter.NoError:
         raise ValueError(str(result))
-    return {"path": path, "crs": a["crs"], "selected_only": options.onlySelectedFeatures}
+    return {
+        "path": path,
+        "crs": target_crs,
+        "selected_only": options.onlySelectedFeatures,
+    }
 
 
 def render_raster(engine, a):
@@ -160,10 +233,28 @@ def style_graduated(engine, a):
     renderer.updateClasses(layer, a["classes"])
     renderer.updateColorRamp(ramp)
     layer.setRenderer(renderer)
+    layer.setOpacity(a.get("opacity", 1))
+    if a.get("label_field"):
+        field = a["label_field"]
+        if layer.fields().indexFromName(field) < 0:
+            raise ValueError("Unknown label_field")
+        from qgis.core import QgsPalLayerSettings, QgsTextFormat, QgsVectorLayerSimpleLabeling
+        from qgis.PyQt.QtGui import QFont
+
+        settings = QgsPalLayerSettings()
+        settings.fieldName = field
+        text_format = QgsTextFormat()
+        text_format.setFont(QFont("Arial", 10))
+        text_format.setSize(10)
+        settings.setFormat(text_format)
+        layer.setLabeling(QgsVectorLayerSimpleLabeling(settings))
+        layer.setLabelsEnabled(True)
+    layer.triggerRepaint()
     return {
         "layer": layer.id(),
         "renderer": renderer.type(),
         "classes": len(renderer.ranges()),
+        "opacity": layer.opacity(),
         "ranges": [
             {"lower": r.lowerValue(), "upper": r.upperValue(), "label": r.label()}
             for r in renderer.ranges()

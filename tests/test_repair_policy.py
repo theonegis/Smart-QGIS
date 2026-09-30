@@ -6,8 +6,9 @@ import pytest
 from smart_qgis.bridge import WorkerError
 from smart_qgis.contracts import StepContract
 from smart_qgis.coordinator import TaskCoordinator
-from smart_qgis.task_store import TaskError, TaskStore
+from smart_qgis.task_store import TaskError, TaskStore, temporary_output_root
 from smart_qgis.task_tools import TaskClarify
+from smart_qgis.tools import build_tools
 
 
 @pytest.fixture
@@ -45,7 +46,7 @@ async def test_user_guidance_can_revise_map_layers_without_replacing_task(coordi
             "layers": None,
         })
     task_id = coordinator.store.task_id
-    await coordinator.call("task_record_guidance", {
+    await coordinator.call("task_update", {
         "task_id": task_id,
         "continuation_token": coordinator.issue_continuation(),
         "question": "Which layers should the map show?",
@@ -57,16 +58,22 @@ async def test_user_guidance_can_revise_map_layers_without_replacing_task(coordi
         "title": "Risk map", "raster_ramp": "Viridis", "dpi": 150,
         "layers": ["undeveloped_areas", "risk_zones"],
     }
-    await coordinator.call("task_record_guidance", {
+    await coordinator.call("task_update", {
         "task_id": task_id,
         "continuation_token": coordinator.issue_continuation(),
         "question": "Where should the legend and scale bar go?",
         "user_response": "Outside the map frame; the data needs the available area.",
-        "map_element_placement": "outside",
+        "map_elements": {
+            "legend": {"frame": "outside", "anchor": "bottom_left"},
+            "scalebar": {"frame": "outside", "anchor": "bottom_right"},
+        },
     })
-    assert coordinator.presentation_options()["map_element_placement"] == "outside"
+    assert coordinator.presentation_options()["map_elements"] == {
+        "legend": {"frame": "outside", "anchor": "bottom_left"},
+        "scalebar": {"frame": "outside", "anchor": "bottom_right"},
+    }
     assert coordinator.presentation_options()["layers"] == ["undeveloped_areas", "risk_zones"]
-    await coordinator.call("task_record_guidance", {
+    await coordinator.call("task_update", {
         "task_id": task_id,
         "continuation_token": coordinator.issue_continuation(),
         "question": "How should the sparse area layer be shown?",
@@ -83,6 +90,75 @@ async def test_user_guidance_can_revise_map_layers_without_replacing_task(coordi
             "question": "Which layers?", "user_response": "Both",
             "map_layers": ["risk_zones", "risk_zones"],
         })
+
+
+async def test_pending_output_conflict_binds_an_explicit_user_answer_and_resumes_only_failed_step(
+    coordinator, tmp_path, monkeypatch,
+):
+    destination = tmp_path / "map.png"
+    destination.write_bytes(b"old")
+    step = plan()
+    store = coordinator.store
+    store.save_step("export_map", step.model_dump(), [], store.task()["state_version"])
+    attempt = store.begin_attempt(
+        "export_map", "export-map-attempt", step.arguments, 1, store.task()["state_version"]
+    )
+    store.fail(attempt["attempt_id"], {
+        "code": "OUTPUT_EXISTS",
+        "message": "Requested output path already exists",
+        "evidence": {"path": str(destination)},
+    })
+    tools = {tool.name: tool for tool in build_tools(coordinator, compact=True)}
+
+    with pytest.raises(TaskError) as missing:
+        await tools["task_update"].ainvoke({
+            "task_id": store.task_id,
+            "instruction": f"overwrite {destination}",
+        })
+    assert missing.value.payload["code"] == "OUTPUT_CONFLICT_DECISION_REQUIRED"
+    assert missing.value.payload["evidence"]["decision_calls"]["overwrite"]["tool"] == "task_update"
+    assert "task_record_guidance" not in str(coordinator.compact_response(missing.value.payload))
+
+    monkeypatch.setattr(coordinator, "verify_inputs", AsyncMock())
+    monkeypatch.setattr(coordinator, "restore_committed", AsyncMock())
+    resumed = await tools["task_update"].ainvoke({
+        "task_id": store.task_id,
+        "instruction": "用户已明确同意直接覆盖该已有文件",
+    })
+    assert resumed["next_call"] == {"tool": "task_execute", "arguments": {}}
+    assert store.db.execute(
+        "SELECT status FROM steps WHERE id='export_map'"
+    ).fetchone()[0] == "PLANNED"
+    assert coordinator.output_conflict_resolution(destination) == "overwrite"
+    resolution = coordinator.store.db.execute(
+        "SELECT body FROM events WHERE kind='OUTPUT_CONFLICT_RESOLUTION' ORDER BY sequence DESC LIMIT 1"
+    ).fetchone()[0]
+    assert json.loads(resolution)["source"] == "explicit_task_update_instruction"
+
+
+async def test_task_start_binds_unambiguous_goal_overwrite_to_declared_paths(tmp_path):
+    coordinator = TaskCoordinator(root=tmp_path / "state")
+    destination = tmp_path / "map.png"
+    try:
+        tools = {tool.name: tool for tool in build_tools(coordinator, compact=True)}
+        started = await tools["task_start"].ainvoke({
+            "goal": "生成结果地图；若有同名文件请直接覆盖。",
+            "deliverables": [{
+                "id": "map", "description": "Result map", "kind": "image",
+                "path": str(destination),
+            }],
+        })
+        assert started["task_id"] == coordinator.store.task_id
+        resolution = coordinator.store.db.execute(
+            "SELECT body FROM events WHERE kind='OUTPUT_CONFLICT_RESOLUTION' ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()[0]
+        assert json.loads(resolution) == {
+            "path": str(destination),
+            "action": "overwrite",
+            "source": "explicit_task_start_goal",
+        }
+    finally:
+        await coordinator.close()
 
 
 @pytest.mark.parametrize("limit", [2, 3, 5])
@@ -431,7 +507,8 @@ async def test_recovery_classification_and_bounded_backoff(coordinator, tmp_path
         with pytest.raises(TaskError if case == "input_changed" else WorkerError):
             await co.run_with_recovery(operation, {}, tmp_path)
     assert co.bridge.call.await_count == calls
-    assert len(list(tmp_path.glob("execution-*"))) == calls
+    execution_root = temporary_output_root(co.store.task_id) / tmp_path.name
+    assert len(list(execution_root.glob("execution-*"))) == calls
     events = [json.loads(row[0]) for row in co.store.db.execute(
         "SELECT body FROM events WHERE kind IN ('NETWORK_RETRY','WORKER_REPLAY') ORDER BY sequence"
     )]
@@ -491,7 +568,7 @@ async def test_accepted_preparation_does_not_reset_failures_before_execution_pro
         return {"attempt_id": "committed-attempt", "status": "READY"}
 
     monkeypatch.setattr(co, "dispatch_locked", committed)
-    executed = await co.dispatch("task_execute_next", {})
+    executed = await co.dispatch("task_execute", {})
     assert executed["correction_budget"]["rejected_submissions"] == 0
     assert co.correction_failures() == 0
 
@@ -548,7 +625,7 @@ async def test_worker_timeout_waits_for_user_before_more_mutations(coordinator, 
         AsyncMock(side_effect=WorkerError("QGIS operation timed out", code="WORKER_TIMEOUT")),
     )
     with pytest.raises(TaskError) as timed_out:
-        await co.dispatch("task_execute", {"task_id": co.store.task_id})
+        await co.dispatch("step_execute", {"task_id": co.store.task_id})
     assert timed_out.value.payload["code"] == "WORKER_TIMEOUT"
     assert co.status()["user_intervention_required"] is True
     with pytest.raises(TaskError) as stopped:
@@ -582,6 +659,28 @@ async def test_worker_timeout_is_not_automatically_replayed(coordinator, tmp_pat
     assert co.store.db.execute("SELECT count(*) FROM events WHERE kind='WORKER_REPLAY'").fetchone()[0] == 0
 
 
+async def test_processing_missing_declared_file_is_an_execution_error(coordinator, tmp_path):
+    co = coordinator
+    co.bridge.call = AsyncMock(return_value={
+        "outputs": {"OUTPUT": str(tmp_path / "reported-but-missing.tif")},
+        "log": "ERROR 1: Unrecognizable band number (0).",
+    })
+    step = StepContract(
+        operation="run_processing",
+        arguments={"algorithm": "gdal:rearrange_bands", "parameters": {"OUTPUT": "output:band"}},
+        outputs=[{"id": "band", "kind": "raster", "binding": "OUTPUT"}],
+        reason="Extract one raster band",
+    )
+
+    with pytest.raises(TaskError) as error:
+        await co.run_with_recovery(step, {}, tmp_path)
+
+    assert error.value.payload["code"] == "OUTPUT_MISSING"
+    assert error.value.payload["phase"] == "execution"
+    assert error.value.payload["evidence"]["algorithm"] == "gdal:rearrange_bands"
+    assert "Unrecognizable band" in error.value.payload["evidence"]["worker_log"]
+
+
 async def test_resume_at_correction_limit_returns_guidance_only(coordinator, monkeypatch):
     co = coordinator
     for _ in range(co.correction_limit):
@@ -593,7 +692,7 @@ async def test_resume_at_correction_limit_returns_guidance_only(coordinator, mon
     assert result["user_intervention_required"] is True
     assert result["intervention_reason"] == "correction_limit"
     assert "next_call" not in result
-    assert "task_record_guidance" in result["next_action"]
+    assert "task_update" in result["next_action"]
 
 
 @pytest.mark.parametrize('invalid_token', [{}, [], 123])
