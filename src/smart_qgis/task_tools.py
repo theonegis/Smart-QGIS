@@ -359,7 +359,13 @@ class TaskRun(Model):
     )
     title: str | None = Field(None, description="Reader-facing map title; omit for a concise title derived from the task goal")
     legend_title: str | None = Field(
-        None, description="Reader-facing legend heading; omit for a language-aware default"
+        None,
+        description=(
+            "Reader-facing legend heading. For a one-layer map it replaces that layer's "
+            "displayed legend name, so the legend shows one name in one language rather than "
+            "a heading plus a duplicate source-layer name. An automatic short bottom legend "
+            "omits a generic heading; the automatic right-side long legend shows one."
+        ),
     )
     map_language: Literal["auto", "zh", "en"] = Field(
         "auto",
@@ -368,7 +374,13 @@ class TaskRun(Model):
             "auto follows the original goal/title; zh or en forces the default language without translating user text."
         ),
     )
-    show_legend_title: bool = Field(True, description="Whether to display the legend heading")
+    show_legend_title: bool | None = Field(
+        None,
+        description=(
+            "Whether to force a legend heading. Omit for automatic behavior: no generic heading "
+            "for a short bottom legend, and one for an automatic long right-side legend."
+        ),
+    )
     north_arrow: bool = Field(False, description="Add a north arrow only when explicitly requested")
     page_orientation: Literal["auto", "portrait", "landscape"] = Field(
         "auto", description="Map page orientation; auto fits the thematic data footprint"
@@ -579,7 +591,12 @@ class TaskClarify(Model):
         None, description="Optional actual user revision of the reader-facing map title; rebuilds only presentation"
     )
     legend_title: str | None = Field(
-        None, description="Optional actual user revision of the reader-facing legend heading; rebuilds only presentation"
+        None,
+        description=(
+            "Optional actual user revision of the reader-facing legend heading; for a one-layer "
+            "map it replaces the displayed layer name. A supplied shared heading is retained for "
+            "a multi-layer bottom legend. Rebuilds only presentation."
+        ),
     )
     map_language: Literal["auto", "zh", "en"] | None = Field(
         None, description="Optional actual user choice for server-generated map-text language; rebuilds only presentation"
@@ -806,7 +823,10 @@ class StepPrepare(TaskContinuation):
     title: str | None = Field(None, description="Map title; omit for a concise title derived from the task goal")
     legend_title: str | None = Field(None, description="Optional reader-facing legend heading")
     map_language: Literal["auto", "zh", "en"] = "auto"
-    show_legend_title: bool = True
+    show_legend_title: bool | None = Field(
+        None,
+        description="Force a legend heading on/off; omit for the automatic placement-based default",
+    )
     north_arrow: bool = False
     page_orientation: Literal["auto", "portrait", "landscape"] = "auto"
     map_crs: str | None = Field(None, description="Map display CRS for on-the-fly projection")
@@ -866,7 +886,10 @@ class WorkflowRun(TaskContinuation):
     title: str | None = Field(None, description="Map title; omit for a concise title derived from the task goal")
     legend_title: str | None = Field(None, description="Optional reader-facing legend heading")
     map_language: Literal["auto", "zh", "en"] = "auto"
-    show_legend_title: bool = True
+    show_legend_title: bool | None = Field(
+        None,
+        description="Force a legend heading on/off; omit for the automatic placement-based default",
+    )
     north_arrow: bool = False
     page_orientation: Literal["auto", "portrait", "landscape"] = "auto"
     map_crs: str | None = Field(None, description="Map display CRS for on-the-fly projection")

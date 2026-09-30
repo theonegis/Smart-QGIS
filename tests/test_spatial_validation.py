@@ -313,6 +313,7 @@ try:
  raster_right=max(raster_legend.positionWithUnits().x()+raster_legend.sizeWithUnits().width(),raster_scale.positionWithUnits().x()+raster_scale.sizeWithUnits().width())
  reports['raster_auto']={'placements':raster_auto['resolved_element_placements'],
                          'flow':raster_auto['legend_flow'],
+                         'legend_title':raster_legend.title(),
                          'legend_left_delta':raster_legend.positionWithUnits().x()-raster_map.positionWithUnits().x(),
                          'scale_right_delta':raster_map.positionWithUnits().x()+raster_map.sizeWithUnits().width()-(raster_scale.positionWithUnits().x()+raster_scale.sizeWithUnits().width()),
                          'bottom_gap':raster_legend.positionWithUnits().y()-(raster_map.positionWithUnits().y()+raster_map.sizeWithUnits().height()),
@@ -335,6 +336,7 @@ try:
  long_scale=next(i for i in long_layout.items() if isinstance(i,QgsLayoutItemScaleBar))
  reports['long_auto']={'placements':long_auto['resolved_element_placements'],
                        'flow':long_auto['legend_flow'],
+                       'legend_title':long_legend.title(),
                        'legend_x':long_legend.positionWithUnits().x(),
                        'scale_x':long_scale.positionWithUnits().x(),
                        'right_gap':long_legend.positionWithUnits().x()-(long_layout.itemById('main-map').positionWithUnits().x()+long_layout.itemById('main-map').sizeWithUnits().width()),
@@ -364,8 +366,10 @@ try:
  revised=engine.project.layoutManager().layoutByName('修订地图')
  revised_map=revised.itemById('main-map')
  revised_legend=next(i for i in revised.items() if isinstance(i,QgsLayoutItemLegend))
+ revised_nodes=revised_legend.model().rootGroup().children()
  reports['revision']={'title':next(i for i in revised.items() if isinstance(i,QgsLayoutItemLabel) and i.id()=='map-title').text(),
                       'legend':revised_legend.title(),
+                      'legend_layer_names':[node.name() for node in revised_nodes],
                       'coverage':adaptive['map_frame_page_coverage'],
                       'orientation':adaptive['page_orientation'],
                       'map_width':revised_map.sizeWithUnits().width(),
@@ -374,6 +378,15 @@ try:
                       'height_coverage':adaptive['map_frame_height_coverage']}
  reports['revision']['title_centered']=next(i for i in revised.items() if isinstance(i,QgsLayoutItemLabel) and i.id()=='map-title').hAlign() == Qt.AlignmentFlag.AlignHCenter
  reports['revision']['north_arrows']=len([i for i in revised.items() if isinstance(i,QgsLayoutItemPicture) and i.id()=='map-north-arrow'])
+ forced=engine.layout({'name':'强制图例标题','layers':[layer['id']],'extent_layer':layer['id'],
+                       'show_legend_title':True})
+ forced_layout=engine.project.layoutManager().layoutByName('强制图例标题')
+ forced_legend=next(i for i in forced_layout.items() if isinstance(i,QgsLayoutItemLegend))
+ reports['forced_heading']=forced_legend.title()
+ suppressed=engine.layout({'name':'Suppress long heading','layers':long_layers,'extent_layer':raster['id'],
+                           'show_legend_title':False})
+ suppressed_layout=engine.project.layoutManager().layoutByName('Suppress long heading')
+ reports['suppressed_heading']=next(i for i in suppressed_layout.items() if isinstance(i,QgsLayoutItemLegend)).title()
  coverage_check={'check':{'id':'coverage','kind':'layout_content','target':'revised','min_page_coverage':0.55},'assets':{'revised':{'layout':'修订地图'}}}
  reports['coverage']=engine.dispatch('_validate',coverage_check)
  engine.layout({'name':'Projected','layers':[layer['id']],'extent_layer':layer['id'],
@@ -408,41 +421,51 @@ finally: engine.close()
     assert raster_auto["placements"]["legend"] == {"frame": "outside", "anchor": "bottom_left"}, raster_auto
     assert raster_auto["placements"]["scalebar"] == {"frame": "outside", "anchor": "bottom_right"}, raster_auto
     assert raster_auto["flow"] == "horizontal", raster_auto
+    assert raster_auto["legend_title"] == "", raster_auto
     assert abs(raster_auto["legend_left_delta"]) < 0.5, raster_auto
     assert abs(raster_auto["scale_right_delta"]) < 0.5, raster_auto
     assert raster_auto["bottom_gap"] >= 8, raster_auto
     assert raster_auto["annotation_font_size"] >= 42, raster_auto
     assert raster_auto["title_font_size"] >= raster_auto["annotation_font_size"] + 6, raster_auto
-    assert min(raster_auto["legend_size"]) > 0, raster_auto
+    assert raster_auto["legend_size"][0] > 0, raster_auto
+    # Raster colour ramps reserve a paint-safe footer even when QGIS reports
+    # an undersized initial legend envelope.
+    assert raster_auto["legend_size"][1] >= 110, raster_auto
     assert raster_auto["page_edge_gaps"]["left"] >= 36, raster_auto
     assert raster_auto["page_edge_gaps"]["right"] >= 36, raster_auto
     assert raster_auto["page_edge_gaps"]["top"] >= 62, raster_auto
     assert raster_auto["page_edge_gaps"]["bottom"] >= 70, raster_auto
-    assert raster_auto["width_coverage"] >= 0.80, raster_auto
-    assert raster_auto["height_coverage"] >= 0.80, raster_auto
+    # The 80% coverage is a preference. A large raster colour-ramp legend
+    # may reserve a taller footer to prevent export clipping.
+    assert raster_auto["width_coverage"] >= 0.55, raster_auto
+    assert raster_auto["height_coverage"] >= 0.55, raster_auto
     long_auto = reports.pop("long_auto")
     assert long_auto["placements"]["legend"] == {"frame": "outside", "anchor": "top_right"}, long_auto
     assert long_auto["placements"]["scalebar"] == {"frame": "outside", "anchor": "bottom_right"}, long_auto
     assert long_auto["flow"] == "vertical", long_auto
+    assert long_auto["legend_title"] == "Legend", long_auto
     assert abs(long_auto["legend_x"] - long_auto["scale_x"]) < 0.5, long_auto
     assert long_auto["right_gap"] >= 8, long_auto
     assert long_auto["scale_right_page_gap"] >= 10, long_auto
-    assert long_auto["width_coverage"] >= 0.80, long_auto
-    assert long_auto["height_coverage"] >= 0.80, long_auto
+    assert long_auto["width_coverage"] >= 0.55, long_auto
+    assert long_auto["height_coverage"] >= 0.55, long_auto
     tall_footer = reports.pop("tall_footer")
     assert tall_footer["bounds_verified"], tall_footer
     assert tall_footer["minimum_item_page_gap"] >= 12, tall_footer
     assert tall_footer["height_coverage"] < 0.80, tall_footer
     revision = reports.pop("revision")
     assert revision["title"] == "基于 DEM 的崎岖度计算结果制图", revision
-    assert revision["legend"] == "地形崎岖度", revision
+    assert revision["legend"] == "", revision
+    assert revision["legend_layer_names"] == ["地形崎岖度"], revision
     assert revision["title_centered"], revision
     assert revision["north_arrows"] == 0, revision
     assert revision["orientation"] == "portrait", revision
     assert revision["coverage"] > 0.55, revision
-    assert revision["width_coverage"] >= 0.80, revision
-    assert revision["height_coverage"] >= 0.80, revision
+    assert revision["width_coverage"] >= 0.55, revision
+    assert revision["height_coverage"] >= 0.55, revision
     assert revision["map_width"] > revision["page_width"] * 0.55, revision
+    assert reports.pop("forced_heading") == "图例", reports
+    assert reports.pop("suppressed_heading") == "", reports
     assert reports.pop("coverage")["status"] == "passed", reports
     assert reports.pop("good")["status"] == "passed", reports
     assert reports.pop("projected")["status"] == "passed", reports

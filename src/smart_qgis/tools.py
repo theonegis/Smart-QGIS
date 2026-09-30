@@ -174,7 +174,10 @@ class Layout(Arguments):
     map_language: Literal["auto", "zh", "en"] = Field(
         "auto", description="Language for server-generated map text; auto follows the title"
     )
-    show_legend_title: bool = True
+    show_legend_title: bool | None = Field(
+        None,
+        description="Force a legend heading on/off; omit for the automatic placement-based default",
+    )
     scalebar: bool = True
     north_arrow: bool = Field(False, description="Add a north arrow only when the user explicitly requests one")
     grid: bool = True

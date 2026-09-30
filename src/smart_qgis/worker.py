@@ -1105,7 +1105,12 @@ class Engine:
                 extent.combineExtentWith(self.visible_extent(layer, target))
         if extent.isEmpty() or not extent.isFinite():
             raise ValueError("Map extent must be finite and nonempty")
-        extent.scale(1.08)
+        # A raster is itself the map image.  Its valid extent should meet the
+        # map frame exactly unless the caller explicitly supplies a broader
+        # extent; white internal padding is useful for vectors but wastes the
+        # thematic frame for DEMs and other raster products.
+        if not any(isinstance(layer_item, QgsRasterLayer) for layer_item in layers):
+            extent.scale(1.08)
         layout = QgsPrintLayout(self.project)
         layout.initializeDefaults()
         layout.setName(name)
@@ -1529,15 +1534,29 @@ class Engine:
             use_chinese = map_language == "zh" or (
                 map_language == "auto" and bool(re.search(r"[\u4e00-\u9fff]", map_title))
             )
-            if a.get("show_legend_title", True):
-                # A one-layer legend already displays the reader-facing layer
-                # name.  Adding a generic “Legend/图例” title duplicates a
-                # line, consumes the compact footer and makes the type look
-                # smaller.  Keep an explicit heading, or add a generic title
-                # only when several thematic layers need a shared heading.
+            explicit_legend_name = (a.get("legend_title") or "").strip()
+            one_layer_legend = len(thematic_layers) == 1
+            requested_legend_heading = a.get("show_legend_title")
+            if requested_legend_heading is None:
+                # Default: a short bottom legend has only its item labels;
+                # the automatic long right-side legend gets a shared heading.
+                show_shared_legend_heading = not one_layer_legend and not automatic_bottom_row
+            else:
+                # The published bool is an explicit user override of the
+                # default. A one-layer legend still keeps its item label
+                # unique; a forced heading is the generic 图例/Legend label.
+                show_shared_legend_heading = bool(requested_legend_heading)
+            if show_shared_legend_heading:
+                # A multiple-layer legend may have a shared reader-facing
+                # heading. A one-layer legend instead gets exactly one
+                # reader-facing label: its layer name, or the explicit
+                # replacement below. Never render both an English source
+                # name and its supplied translation as two legend lines.
                 legend.setTitle(
-                    a.get("legend_title")
-                    or ("" if len(thematic_layers) == 1 else ("图例" if use_chinese else "Legend"))
+                    (
+                        ("图例" if use_chinese else "Legend")
+                        if one_layer_legend else explicit_legend_name or ("图例" if use_chinese else "Legend")
+                    )
                 )
             else:
                 legend.setTitle("")
@@ -1548,10 +1567,16 @@ class Engine:
                 legend.setAutoUpdateModel(False)
             root = legend.model().rootGroup()
             root.clear()
-            for layer in layers:
-                if layer.providerType() != "wms":
-                    node = root.addLayer(layer)
-                    legend_nodes = legend.model().layerLegendNodes(node)
+            for layer in thematic_layers:
+                node = root.addLayer(layer)
+                # QgsLayerTreeLayer keeps a display-only name separate from
+                # QgsMapLayer.name(). For a one-layer map, an explicitly
+                # requested legend name is therefore a replacement label,
+                # not an additional heading. This preserves the project
+                # layer's original name while giving readers one language.
+                if one_layer_legend and explicit_legend_name:
+                    node.setName(explicit_legend_name)
+                legend_nodes = legend.model().layerLegendNodes(node)
                 # Generic raw-band labels describe source encoding, not a
                 # cartographic theme. Remove just those entries while keeping
                 # meaningful color-ramp/category nodes (whose labels may be
@@ -1593,6 +1618,13 @@ class Engine:
                 "horizontal" if legend_flow == "horizontal" or automatic_bottom_row else "vertical"
             )
             layout.addLayoutItem(legend)
+            # Legend model changes and enlarged text formats are not always
+            # reflected by QGIS's first ``sizeWithUnits`` value. Refresh and
+            # resize it before measuring; otherwise a colour ramp may paint
+            # below the reported item box and be clipped by the page export.
+            legend.setResizeToContents(True)
+            legend.refresh()
+            legend.resizeToContents()
             legend.adjustBoxSize()
             # A raw multiband raster may intentionally have no reader-facing
             # legend nodes after generic Band labels are removed. QGIS then
@@ -1600,9 +1632,16 @@ class Engine:
             # name. Give every legend a real minimum envelope so anchoring,
             # background and collision checks describe what readers see.
             natural_size = legend.sizeWithUnits()
+            raster_legend_minimum_height = 110 if any(
+                isinstance(layer_item, QgsRasterLayer) for layer_item in thematic_layers
+            ) else 28
             legend.attemptResize(QgsLayoutSize(
                 max(55, natural_size.width()),
-                max(28, natural_size.height(), 8 + len(layers) * (auxiliary_text_size * .45 + 3)),
+                max(
+                    raster_legend_minimum_height,
+                    natural_size.height(),
+                    8 + len(layers) * (auxiliary_text_size * .45 + 3),
+                ),
             ))
             legend.setId("map-legend")
             place(legend, "legend", 55, 28)
@@ -1788,7 +1827,8 @@ class Engine:
                 name: placements[name] for name, enabled in enabled_elements.items() if enabled
             },
             "legend_layer_names": [
-                layer_item.name() for layer_item in layers if layer_item.providerType() != "wms"
+                explicit_legend_name if one_layer_legend and explicit_legend_name else layer_item.name()
+                for layer_item in thematic_layers
             ],
             "legend_flow": resolved_legend_flow,
             "legend_border": (
